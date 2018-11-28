@@ -1,4 +1,6 @@
 /Android.common.mk
+Session.vim
+.undodir
 Makefile
 Makefile.in
 aclocal.m4
