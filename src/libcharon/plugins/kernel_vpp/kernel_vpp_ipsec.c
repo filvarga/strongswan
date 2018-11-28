@@ -21,14 +21,9 @@
 #include <collections/hashtable.h>
 #include <threading/mutex.h>
 
-#define vl_typedefs
-#define vl_endianfun
-#include <vpp/api/vpe_all_api_h.h>
-#undef vl_typedefs
-#undef vl_endianfun
-
+#include "vpp/model/rpc/rpc.grpc-c.h"
 #include "kernel_vpp_ipsec.h"
-#include "kernel_vpp_shared.h"
+#include "kernel_vpp_grpc.h"
 
 #define PRIO_BASE 384
 
@@ -90,6 +85,9 @@ struct private_kernel_vpp_ipsec_t {
 //  - if we need to setup interface ip address ?
 //  interface vrf - ??
 
+// TODO: review if security association shouldn't contain
+// src or dst ?!
+
 /**
  * Security association entry
  */
@@ -110,6 +108,10 @@ typedef struct {
     uint16_t vpp_int_alg;
     /** Integrity protection key */
     chunk_t int_key;
+
+    // TODO:
+    // ADD SRC/DST - guess those will be reversed based on OUTPUT/INPUT
+    // interface - this has to be checked out
 } sa_t;
 
 /**
@@ -124,9 +126,9 @@ typedef struct {
     /** unique ID */ 
     uint32_t reqid;
     /** Source address */
-    host_t *src; 
+    host_t *src; // !!! those may not be what you think they are
     /** Destination address */
-    host_t *dst;
+    host_t *dst; // !!! those may not be what you think they are
 } sp_t;
 
 /**
@@ -174,6 +176,9 @@ static void route_destroy(route_entry_t *this)
 /**
  * (Un)-install a single route
  */
+// REVIEW: how is the route used in this logic we will have to find out
+// if there is point in using it for tunnel interface
+#if 0
 static void manage_route(private_kernel_vpp_ipsec_t *this, bool add,
                          traffic_selector_t *dst_ts, host_t *src, host_t *dst)
 {
@@ -238,6 +243,7 @@ static void manage_route(private_kernel_vpp_ipsec_t *this, bool add,
              prefixlen, dst, NULL, if_name);
     }
 }
+#endif
 
 /**
  * Hash function for IPsec SA
@@ -362,71 +368,193 @@ static uint32_t calculate_priority(policy_priority_t policy_priority,
 /**
  * Get sw_if_index from interface name
  */
-static uint32_t get_sw_if_index(char *interface)
+static status_t get_sw_if_index(char *name, uint32_t **if_index)
 {
-    char *out = NULL;
-    int out_len;
-    vl_api_sw_interface_dump_t *mp;
-    vl_api_sw_interface_details_t *rmp;
-    uint32_t sw_if_index = ~0;
+    Interfaces__InterfacesState__Interface if_state;
+    Rpc__DumpRequest rq = RPC__DUMP_REQUEST__INIT;
+    Rpc__InterfaceResponse *rp;
+    status_t rc;
+    size_t n;
 
-    mp = vl_msg_api_alloc (sizeof (*mp));
-    memset(mp, 0, sizeof(*mp));
-    mp->_vl_msg_id = ntohs(VL_API_SW_INTERFACE_DUMP);
-    mp->name_filter_valid = 1;
-    strcpy(mp->name_filter, interface);
-    if (vac->send_dump(vac, (char *)mp, sizeof(*mp), &out, &out_len))
+    rc = vac->dump_interfaces_state(vac, &rq, &rp);
+    if (rc == SUCCESS)
     {
-        goto error;
+        n = rp->n_interfaces;
+        while (n--)
+        {
+            if_state = rp->interfaces[n];
+            if (strcmp(name, if_state->name) == 0)
+            {
+                if (if_state->has_if_index)
+                {
+                    *if_index = if_state->if_index;
+                    return SUCCESS;
+                }
+                break;
+            }
+        }
     }
-    if (!out_len)
-    {
-        goto error;
-    }
-    rmp = (void *)out;
-    sw_if_index = ntohl(rmp->sw_if_index);
-
-error:
-    free(out);
-    vl_msg_api_free(mp);
-    return sw_if_index;
+    return FAILED;
 }
 
+// TODO:
+// split this for add / del, those are different rpc calls
+// implement matching algo for 4 callsTO 1 mapping
+// if mapping setup completed do the call (we should not care what
+// call does the finishing rpc call)
+// so add_sp or add_sa
+// the call will be add_tunnel
+// we need map of 4
+// we need to do matching for add_sp (policy) we can match based on
+//  interface but is this viable ?
+// are sa and sp interface based ?
+//  sps definitely are ! because they use IP address of the input interface
+//  as src (if we are senders of IPSEC traffic)
 /**
- * Enable or disable SPD on an insterface
+ * Add or remove a policy
  */
-static status_t interface_add_del_spd(bool add, uint32_t spd_id, uint32_t sw_if_index)
+static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
+                              kernel_ipsec_policy_id_t *id,
+                              kernel_ipsec_manage_policy_t *data)
 {
-    char *out = NULL;
-    int out_len;
-    vl_api_ipsec_interface_add_del_spd_t *mp;
-    vl_api_ipsec_interface_add_del_spd_reply_t *rmp;
-    status_t rv = FAILED;
 
-    mp = vl_msg_api_alloc (sizeof (*mp));
-    memset(mp, 0, sizeof(*mp));
-    mp->_vl_msg_id = ntohs(VL_API_IPSEC_INTERFACE_ADD_DEL_SPD);
-    mp->is_add = add;
-    mp->spd_id = ntohl(spd_id);
-    mp->sw_if_index = ntohl(sw_if_index);
-    if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
+  /* extracting keys !!
+    // crypto key
+    mp->crypto_algorithm = enc_alg;
+    mp->crypto_key_length = data->enc_key.len;
+    memcpy(mp->crypto_key, data->enc_key.ptr, data->enc_key.len);
+
+    // integrity key
+    mp->integrity_algorithm = ia;
+    mp->integrity_key_length = data->int_key.len;
+    memcpy(mp->integrity_key, data->int_key.ptr, data->int_key.len);
+  */
+
+    spd_t *spd;
+    char *out = NULL, *interface;
+    int out_len;
+    uint32_t sw_if_index, spd_id, *sad_id;
+    status_t rv = FAILED;
+    uint32_t priority, auto_priority;
+    chunk_t src_from, src_to, dst_from, dst_to;
+    host_t *src, *dst, *addr;
+
+    uint32_t if_index;
+    status_t rc;
+
+    this->mutex->lock(this->mutex);
+    if (!id->interface)
     {
-        DBG1(DBG_KNL, "vac %s interface SPD failed", add ? "adding" : "removing");
-        goto error;
+        addr = id->dir == POLICY_IN ? data->dst : data->src;
+        if (!charon->kernel->get_interface(charon->kernel, addr, &interface))
+        {
+            DBG1(DBG_KNL, "policy no interface %H", addr);
+            goto error;
+        }
+        id->interface = interface;
     }
-    rmp = (void *)out;
-    if (rmp->retval)
+    // we use this to get it out
+    spd = this->spds->get(this->spds, id->interface);
+    if (!spd)
     {
-        DBG1(DBG_KNL, "%s interface SPD failed rv:%d", add ? "add" : "remove", ntohl(rmp->retval));
-        goto error;
+        if (!add)
+        {
+            DBG1(DBG_KNL, "SPD for %s not found", id->interface);
+            goto error;
+        }
+        rc = get_sw_if_index(id->interface, &if_index);
+        if (rc != SUCCESS)
+        {
+            DBG1(DBG_KNL, "sw_if_index for %s not found", id->interface);
+            goto error;
+        }
+        // ditch it
+        spd_id = ref_get(&this->next_spd_id);
+        if (spd_add_del(TRUE, spd_id))
+        {
+            goto error;
+        }
+        if (manage_bypass(TRUE, spd_id))
+        {
+            goto error;
+        }
+        if (interface_add_del_spd(TRUE, spd_id, sw_if_index))
+        {
+            goto error;
+        }
+        INIT(spd,
+                .spd_id = spd_id,
+                .sw_if_index = sw_if_index,
+                .policy_num = 0,
+        );
+        this->spds->put(this->spds, id->interface, spd);
+    }
+
+    auto_priority = calculate_priority(data->prio, id->src_ts, id->dst_ts);
+    priority = data->manual_prio ? data->manual_prio : auto_priority;
+
+    mp->_vl_msg_id = ntohs(VL_API_IPSEC_SPD_ADD_DEL_ENTRY);
+    mp->is_add = add;
+    mp->spd_id = ntohl(spd->spd_id);
+    mp->priority = ntohl(INT_MAX - priority);
+
+    // we need this to know what we are configuring
+    mp->is_outbound = id->dir == POLICY_OUT;
+
+
+    // this will be interesting, those should be add as routes i guess
+    if (id->dir == POLICY_OUT)
+    {
+        src_from = id->src_ts->get_from_address(id->src_ts);
+        src_to = id->src_ts->get_to_address(id->src_ts);
+        src = host_create_from_chunk(mp->is_ipv6 ? AF_INET6 : AF_INET, src_to, 0);
+        dst_from = id->dst_ts->get_from_address(id->dst_ts);
+        dst_to = id->dst_ts->get_to_address(id->dst_ts);
+        dst = host_create_from_chunk(mp->is_ipv6 ? AF_INET6 : AF_INET, dst_to, 0);
+    }
+    else
+    {
+        dst_from = id->src_ts->get_from_address(id->src_ts);
+        dst_to = id->src_ts->get_to_address(id->src_ts);
+        dst = host_create_from_chunk(mp->is_ipv6 ? AF_INET6 : AF_INET, src_to, 0);
+        src_from = id->dst_ts->get_from_address(id->dst_ts);
+        src_to = id->dst_ts->get_to_address(id->dst_ts);
+        src = host_create_from_chunk(mp->is_ipv6 ? AF_INET6 : AF_INET, dst_to, 0);
+    }
+
+    if (src->is_anyaddr(src) && dst->is_anyaddr(dst))
+    {
+        mp->is_ip_any = 1;
+    }
+    else
+    {
+        memcpy(mp->local_address_start, src_from.ptr, src_from.len);
+        memcpy(mp->local_address_stop, src_to.ptr, src_to.len);
+        memcpy(mp->remote_address_start, dst_from.ptr, dst_from.len);
+        memcpy(mp->remote_address_stop, dst_to.ptr, dst_to.len);
+    }
+    mp->local_port_start = ntohs(id->src_ts->get_from_port(id->src_ts));
+    mp->local_port_stop = ntohs(id->src_ts->get_to_port(id->src_ts));
+    mp->remote_port_start = ntohs(id->dst_ts->get_from_port(id->dst_ts));
+    mp->remote_port_stop = ntohs(id->dst_ts->get_to_port(id->dst_ts));
+
+    if (this->install_routes && id->dir == POLICY_OUT && !mp->protocol)
+    {
+        // important !!! we need a route 
+        // we may also need to enable promiscuous on input/output interface
+        // what about arp ? 
+        // set int state ipsec0 up !! also required
+        if (data->type == POLICY_IPSEC && data->sa->mode != MODE_TRANSPORT)
+        {
+            manage_route(this, add, id->dst_ts, data->src, data->dst);
+        }
     }
     rv = SUCCESS;
-
 error:
-    free(out);
-    vl_msg_api_free(mp);
+    this->mutex->unlock(this->mutex);
     return rv;
 }
+
 
 /**
  * Add or remove a policy

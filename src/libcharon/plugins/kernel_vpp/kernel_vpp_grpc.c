@@ -89,6 +89,22 @@ METHOD(vac_t, vac_dump_interfaces, status_t, private_vac_t *this,
     return rpc_status ? FAILED : SUCCESS;
 }
 
+#if 0
+METHOD(vac_t, vac_dump_interfaces_state, status_t, private_vac_t *this,
+        Rpc__DumpRequest *rq, Rpc__InterfaceStateResponse **rp)
+{
+    int rpc_status = rpc__data_dump_service__dump_interfaces_state(
+            this->grpc_client,
+            NULL, /* metadata array */
+            0, /* flags */
+            rq,
+            rp,
+            NULL /* status */,
+            -1 /* timeout */);
+    return rpc_status ? FAILED : SUCCESS;
+}
+#endif
+
 METHOD(vac_t, vac_dump_routes, status_t, private_vac_t *this,
         Rpc__DumpRequest *rq, Rpc__RoutesResponse **rp)
 {
