@@ -45,29 +45,21 @@ struct private_kernel_vpp_ipsec_t {
     kernel_vpp_ipsec_t public;
 
     /**
-     * Next security association database entry ID to allocate
-     */
-    refcount_t next_sad_id;
-
-    /**
-     * Next security policy database entry ID to allocate
-     */
-    refcount_t next_spd_id;
-
-    /**
      * Mutex to lock access to installed policies
      */
     mutex_t *mutex;
 
     /**
-     * Hash table of instaled SA, as kernel_ipsec_sa_id_t => sa_t
+     * Hash table containing Security Association Database (SAD)
+     * kernel_ipsec_sa_id_t => sa_t
      */
-    hashtable_t *sas;
+    hashtable_t *sad;
 
     /**
-     * Hash table of security policy databases, as nterface => spd_t
+     * Hash table containing Security Policy Database (SPD)
+     * iterface => spd_t
      */
-    hashtable_t *spds;
+    hashtable_t *spd;
 
     /**
      * Linked list of installed routes
@@ -90,27 +82,52 @@ struct private_kernel_vpp_ipsec_t {
     bool install_routes;
 };
 
+// interface esn - extended sequence number
+// interface replay - anti replay option
+// interface name
+// interface enabled
+// interface ip_addresses ?? (repeated, use of ?)
+//  - if we need to setup interface ip address ?
+//  interface vrf - ??
+
 /**
  * Security association entry
  */
 typedef struct {
-    /** VPP SA ID */
-    uint32_t sa_id;
-    /** Data required to add/delete SA to VPP */
-    vl_api_ipsec_sad_add_del_entry_t *mp;
+    // TODO: test if it is the same as in ipsec_sa_cfg_t
+    // and that would meen it is usable for us to match
+    // SA to SP
+    /** kernel_ipsec_add_sa_t reqid */
+    /** unique ID */ 
+    uint32_t reqid;
+    /** SPI */
+    uint32_t spi;
+    /** Encryption algorithm */
+    uint16_t enc_alg;
+    /** Encryption key */ 
+    chunk_t enc_key;
+    /** Integrity protection algorithm */
+    uint16_t int_alg;
+    /** Integrity protection key */
+    chunk_t int_key;
 } sa_t;
 
 /**
- * Security policy database
+ * Security policy entry
  */
 typedef struct {
-    /** VPP SPD ID */
-    uint32_t spd_id;
-    /** Networking interface ID restricting policy */
+    /** Direction of traffic */
+    policy_dir dir;
+    /** Networking interface ID */
     uint32_t sw_if_index;
-    /** Policy count for this SPD */
-    refcount_t policy_num;
-} spd_t;
+    /** kernel_ipsec_add_sa_t reqid */
+    /** unique ID */ 
+    uint32_t reqid;
+    /** Source address */
+    host_t *src; 
+    /** Destination address */
+    host_t *dst;
+} sp_t;
 
 /**
  * Installed route
@@ -588,6 +605,7 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
         }
         id->interface = interface;
     }
+    // we use this to get it out
     spd = this->spds->get(this->spds, id->interface);
     if (!spd)
     {
@@ -631,6 +649,7 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
     mp->spd_id = ntohl(spd->spd_id);
     mp->priority = ntohl(INT_MAX - priority);
     mp->is_outbound = id->dir == POLICY_OUT;
+    // we don't care about these ! if we are doing tunneling interface
     switch (data->type)
     {
         case POLICY_IPSEC:
@@ -643,6 +662,13 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
             mp->policy = 1;
             break;
     }
+    // pozor data->sa je ipsec_sa_cfg_t uplne ako request a neobsahuje
+    // vsetky data
+    // data->sa
+    // we have security association (keys .. integ)
+    // security association is mapped to the SA in add_sa call
+    // well if those data are in data->sa ?? we could ignore
+    // add_sa call
     if ((data->type == POLICY_IPSEC) && data->sa)
     {
         kernel_ipsec_sa_id_t id = {
@@ -725,6 +751,10 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
     }
     if (this->install_routes && id->dir == POLICY_OUT && !mp->protocol)
     {
+        // important !!! we need a route 
+        // we may also need to enable promiscuous on input/output interface
+        // what about arp ? 
+        // set int state ipsec0 up !! also required
         if (data->type == POLICY_IPSEC && data->sa->mode != MODE_TRANSPORT)
         {
             manage_route(this, add, id->dst_ts, data->src, data->dst);
@@ -844,6 +874,155 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             goto error;
             break;
     }
+    mp->integrity_algorithm = ia;
+    mp->integrity_key_length = data->int_key.len;
+    memcpy(mp->integrity_key, data->int_key.ptr, data->int_key.len);
+
+    mp->use_extended_sequence_number = data->esn;
+    if (data->mode == MODE_TUNNEL)
+    {
+        mp->is_tunnel = 1;
+        mp->is_tunnel_ipv6 = id->src->get_family(id->src) == AF_INET6;
+    }
+    src = id->src->get_address(id->src);
+    memcpy(mp->tunnel_src_address, src.ptr, src.len);
+    dst = id->dst->get_address(id->dst);
+    memcpy(mp->tunnel_dst_address, dst.ptr, dst.len);
+    if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
+    {
+        DBG1(DBG_KNL, "vac adding SA failed");
+        goto error;
+    }
+    rmp = (void *)out;
+    if (rmp->retval)
+    {
+        DBG1(DBG_KNL, "add SA failed rv:%d", ntohl(rmp->retval));
+        goto error;
+    }
+
+    this->mutex->lock(this->mutex);
+    INIT(sa_id,
+            .src = id->src->clone(id->src),
+            .dst = id->dst->clone(id->dst),
+            .spi = id->spi,
+            .proto = id->proto,
+    );
+    INIT(sa,
+            .sa_id = sad_id,
+            .mp = mp,
+    );
+    this->sas->put(this->sas, sa_id, sa);
+    this->mutex->unlock(this->mutex);
+    rv = SUCCESS;
+
+error:
+    free(out);
+    return rv;
+}
+
+// NEW THIS IS REMAKE
+// new stuff (should use grpc-c)
+METHOD(kernel_ipsec_t, add_sa, status_t,
+    private_kernel_vpp_ipsec_t *this, kernel_ipsec_sa_id_t *id,
+    kernel_ipsec_add_sa_t *data)
+{
+
+
+    // WHAT DO WE DO ?!
+    //
+    // we save the SA in some hash table or something possible lookup
+    // pop it out then ? basically we should push it to some kind of stack
+    //
+    char *out = NULL;
+    int out_len;
+
+    Rpc__DataRequest req;
+    Rpc__PutResponse rsp;
+
+    // get rid of it
+    uint32_t sad_id = ref_get(&this->next_sad_id);
+    uint8_t ca = 0, ia = 0;
+    status_t rv = FAILED;
+    chunk_t src, dst;
+    kernel_ipsec_sa_id_t *sa_id;
+    sa_t *sa;
+
+    // update
+    mp = vl_msg_api_alloc(sizeof(*mp));
+    memset(mp, 0, sizeof(*mp));
+    mp->_vl_msg_id = ntohs(VL_API_IPSEC_SAD_ADD_DEL_ENTRY);
+    mp->is_add = 1;
+    mp->sad_id = ntohl(sad_id);
+    mp->spi = id->spi;
+    mp->protocol = id->proto == IPPROTO_ESP;
+    //
+
+    switch (data->enc_alg)
+    {
+        case ENCR_NULL:
+            ca = 0;
+            break;
+        case ENCR_AES_CBC:
+            switch (data->enc_key.len * 8)
+            {
+                case 128:
+                    ca = 1;
+                    break;
+                case 192:
+                    ca = 2;
+                    break;
+                case 256:
+                    ca = 3;
+                    break;
+                default:
+                    goto error;
+                    break;
+            }
+            break;
+        case ENCR_3DES:
+            ca = 4;
+            break;
+        default:
+            DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
+                 encryption_algorithm_names, data->enc_alg);
+            goto error;
+            break;
+    }
+
+    // update
+    mp->crypto_algorithm = ca;
+    mp->crypto_key_length = data->enc_key.len;
+    memcpy(mp->crypto_key, data->enc_key.ptr, data->enc_key.len);
+    //
+
+    switch (data->int_alg)
+    {
+        case AUTH_UNDEFINED:
+            ia = 0;
+            break;
+        case AUTH_HMAC_MD5_96:
+            ia = 1;
+            break;
+        case AUTH_HMAC_SHA1_96:
+            ia = 2;
+            break;
+        case AUTH_HMAC_SHA2_256_128:
+            ia = 4;
+            break;
+        case AUTH_HMAC_SHA2_384_192:
+            ia = 5;
+            break;
+        case AUTH_HMAC_SHA2_512_256:
+            ia = 6;
+            break;
+        default:
+            DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
+                 integrity_algorithm_names, data->int_alg);
+            goto error;
+            break;
+    }
+
+    //
     mp->integrity_algorithm = ia;
     mp->integrity_key_length = data->int_key.len;
     memcpy(mp->integrity_key, data->int_key.ptr, data->int_key.len);
@@ -1029,7 +1208,8 @@ METHOD(kernel_ipsec_t, add_policy, status_t,
     private_kernel_vpp_ipsec_t *this, kernel_ipsec_policy_id_t *id,
     kernel_ipsec_manage_policy_t *data)
 {
-    return manage_policy(this, TRUE, id, data);
+    return NOT_SUPPORTED;
+    //return manage_policy(this, TRUE, id, data);
 }
 
 METHOD(kernel_ipsec_t, query_policy, status_t,
@@ -1043,7 +1223,8 @@ METHOD(kernel_ipsec_t, del_policy, status_t,
     private_kernel_vpp_ipsec_t *this, kernel_ipsec_policy_id_t *id,
     kernel_ipsec_manage_policy_t *data)
 {
-    return manage_policy(this, FALSE, id, data);
+    return NOT_SUPPORTED;
+    //return manage_policy(this, FALSE, id, data);
 }
 
 METHOD(kernel_ipsec_t, flush_policies, status_t,
@@ -1098,13 +1279,14 @@ kernel_vpp_ipsec_t *kernel_vpp_ipsec_create()
                 .destroy = _destroy,
             },
         },
-        .next_sad_id = 0,
-        .next_spd_id = 0,
         .mutex = mutex_create(MUTEX_TYPE_DEFAULT),
-        .sas = hashtable_create((hashtable_hash_t)sa_hash,
+
+        .sad = hashtable_create((hashtable_hash_t)sa_hash,
                                 (hashtable_equals_t)sa_equals, 32),
-        .spds = hashtable_create((hashtable_hash_t)interface_hash,
+
+        .spd = hashtable_create((hashtable_hash_t)interface_hash,
                                  (hashtable_equals_t)interface_equals, 4),
+
         .routes = linked_list_create(),
         .install_routes = lib->settings->get_bool(lib->settings,
                             "%s.install_routes", TRUE, lib->ns),
