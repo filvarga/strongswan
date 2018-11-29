@@ -83,7 +83,7 @@ typedef struct {
     /**
      * unique request ID (2xSA + SP)
      */
-    uint32_t reqid;
+    // uint32_t reqid;
 
     /**
      * SPI
@@ -168,33 +168,6 @@ static bool tunnel_equals(tunnel_t *one, tunnel_t *two)
            one->src_spi == two->src_spi && one->dst_spi == two->dst_spi;;
 }
 
-#define htonll(x) ((1==htonl(1)) ? (x) : ((uint64_t)htonl((x) & 0xFFFFFFFF) << 32) | htonl((x) >> 32))
-
-CALLBACK(route_equals, bool, route_entry_t *a, va_list args)
-{
-    host_t *dst_net, *gateway;
-    uint8_t *prefixlen;
-    char *if_name;
-
-    VA_ARGS_VGET(args, if_name, gateway, dst_net, prefixlen);
-
-    return a->if_name && if_name && streq(a->if_name, if_name) &&
-           a->gateway->ip_equals(a->gateway, gateway) &&
-           a->dst_net->ip_equals(a->dst_net, dst_net) &&
-           a->prefixlen == *prefixlen;
-}
-
-/**
- * Clean up a route entry
- */
-static void route_destroy(route_entry_t *this)
-{
-    this->dst_net->destroy(this->dst_net);
-    this->gateway->destroy(this->gateway);
-    free(this->if_name);
-    free(this);
-}
-
 /**
  * Get sw_if_index from interface name
  */
@@ -218,6 +191,46 @@ static status_t get_sw_if_index(char *name, uint32_t **if_index)
                 if (if_state->has_if_index)
                 {
                     *if_index = if_state->if_index;
+                    return SUCCESS;
+                }
+                break;
+            }
+        }
+    }
+    return FAILED;
+}
+
+/**
+ * Set if_name of tunnel interface based on match
+ */
+static status_t set_tunnel_if_name(tunnel_t *tun, char **if_name)
+{
+    // grpc trash
+    Ipsec__TunnelInterfaces__Tunnel *tunnel = NULL;
+
+    Rpc__DumpRequest req = RPC__DUMP_REQUEST__INIT;
+    Rpc__IPSecTunnelResponse *rsp = NULL;
+    //
+
+    // tun->if_name = strdup(...);
+    status_t rc;
+    size_t n;
+
+    rc = vac->dump_ipsec_tunnels(vac, &req, &rsp);
+    if (rc == SUCCESS)
+    {
+        n = rsp->n_tunnels;
+        while (n--)
+        {
+            tunnel = rsp->tunnels[n];
+
+            // TODO: finish the matching algo (local (SPI + IP), remote (SPI + IP))
+
+            if (strcmp(name, if_state->name) == 0)
+            {
+                if (if_state->has_if_index)
+                {
+                    *if_name = if_state->if_name;
                     return SUCCESS;
                 }
                 break;
@@ -274,26 +287,29 @@ static status_t manage_routes(private_kernel_vpp_ipsec_t *this,
           goto error;
       }
 
+      // TODO: we need to know the actual IP address of the "gateway"
+      // and the name of the tunnel interface
+      // these will be stored in the tunnel !!
+      // there is one thing to consider:
+      // SAs have: (kernel_ipsec_add_sa_t -> data)
+      //  linked_list_t *src_ts; // List of source traffic selectors
+      //  linked_list_t *dst_ts; // List of destinatoin traffic selectors
+      // SPs have: (kernel_ipsec_policy_id_t -> id)
+      //  traffic_selector_t *src_ts; // Source traffic selector
+      //  traffic_selector_t *dst_ts; // Destination traffic selector
+      //
+      // how are these related ?!
+      // if those hold same data we could definitely stop wasting time with
+      // policy calls (we won't need them)
+
       id->dst_ts->to_subnet(id->dst_ts, &dst_net, &prefixlen);
 
       gateway = charon->kernel->get_nexthop(charon->kernel, data->dst, -1, NULL, &if_name);
-
-      // REVIEW:
-      // cache routes so we don't do extra calls ??
-      // we may not need to store any data locally
-      // if we don't care about the extra calls
-
-      // it was cached previously and it did not return
-      // any kind of status so ..
 
       // as stated in the source code doc:
       // kernel_ipsec_manage_policy_t dst is 
       // Destination address of the SA(s) tied to this policy
       // so we know it is the same we don't need to store it
-
-      // TODO: gateway IP address may not be physical interface IP !
-      // it may be tunnel interface IP address
-      // TODO: if_name is for sure not ipsec interface
 
       if (op == ADD_ROUTES)
       {
@@ -328,66 +344,81 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
     private_kernel_vpp_ipsec_t *this, kernel_ipsec_sa_id_t *id,
     kernel_ipsec_add_sa_t *data)
 {
-    tunnel_t *tun;
-    sa_t *sa;
+    // grpc trash
+    Ipsec__TunnelInterfaces__Tunnel tunnel = IPSEC__TUNNEL_INTERFACES__TUNNEL__INIT;
 
+    Rpc__DataRequest req = RPC__DATA_REQUEST__INIT;
+    Rpc__PutResponse *rsp = NULL;
+    //
+
+    tunnel_t *tun;
+    status_t rc;
+    sa_t *sa;
+    
     uint16_t vpp_enc_alg;
     uint16_t vpp_int_alg;
+
+    uint32_t src_spi;
+
+    chunk_t *src_addr;
+    chunk_t *dst_addr;
 
     if (data->mode != MODE_TUNNEL)
     {
         return NOT_SUPPORTED;
     }
-    
-    switch (data->enc_alg)
+
+    /* ENCR_3DES (4) NOT supported in proto definition */
+
+    // TODO: convert to function/macro
+    if (ENCR_NULL == data->enc_alg)
     {
-        case ENCR_NULL:
-            vpp_enc_alg = 0;
-            break;
-        case ENCR_AES_CBC:
-            switch (data->enc_key.len * 8)
-            {
-                case 128:
-                    vpp_enc_alg = 1;
-                    break;
-                case 192:
-                    vpp_enc_alg = 2;
-                    break;
-                case 256:
-                    vpp_enc_alg = 3;
-                    break;
-                default:
-                    return FAILED;
-            }
-            break;
-        case ENCR_3DES:
-            vpp_enc_alg = 4;
-            break;
-        default:
-            DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
-                 encryption_algorithm_names, data->enc_alg);
-            return FAILED;
+        vpp_enc_alg = IPSEC__CRYPTO_ALGORITHM__NONE_CRYPTO;
+    }
+    else if (ENCR_AES_CBC == data->enc_alg)
+    {
+        switch (data->enc_key.len * 8)
+        {
+            case 128:
+                vpp_enc_alg = IPSEC__CRYPTO_ALGORITHM__AES_CBC_128;
+                break;
+            case 192:
+                vpp_enc_alg = IPSEC__CRYPTO_ALGORITHM__AES_CBC_192;
+                break;
+            case 256:
+                vpp_enc_alg = IPSEC__CRYPTO_ALGORITHM__AES_CBC_256;
+                break;
+            default:
+                return FAILED;
+        }
+    }
+    else
+    {
+        DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
+             encryption_algorithm_names, data->enc_alg);
+        return FAILED;
     }
 
+    // TODO: convert to function/macro
     switch (data->int_alg)
     {
         case AUTH_UNDEFINED:
-            vpp_int_alg = 0;
+            vpp_int_alg = IPSEC__INTEG_ALGORITHM__NONE_INTEG;
             break;
         case AUTH_HMAC_MD5_96:
-            vpp_int_alg = 1;
+            vpp_int_alg = IPSEC__INTEG_ALGORITHM__MD5_96;
             break;
         case AUTH_HMAC_SHA1_96:
-            vpp_int_alg = 2;
+            vpp_int_alg = IPSEC__INTEG_ALGORITHM__SHA1_96;
             break;
         case AUTH_HMAC_SHA2_256_128:
-            vpp_int_alg = 4;
+            vpp_int_alg = IPSEC__INTEG_ALGORITHM__SHA_256_128;
             break;
         case AUTH_HMAC_SHA2_384_192:
-            vpp_int_alg = 5;
+            vpp_int_alg = IPSEC__INTEG_ALGORITHM__SHA_384_192;
             break;
         case AUTH_HMAC_SHA2_512_256:
-            vpp_int_alg = 6;
+            vpp_int_alg = IPSEC__INTEG_ALGORITHM__SHA_512_256;
             break;
         default:
             DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
@@ -399,12 +430,11 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
     if (data->inbound)
     {
         INIT(sa,
-              .reqid = data->reqid,
               .spi = id->spi,
               .vpp_enc_alg = vpp_enc_alg,
               .vpp_int_alg = vpp_int_alg,
-              .enc_key = enc_key,
-              .int_key = int_key);
+              .enc_key = data->enc_key->chunk_clone(data->enc_key),
+              .int_key = data->int_key->chunk_clone(data->int_key));
 
         // reqid is unique for each entry (2xSA + SP)
         this->mutex->lock(this->mutex);
@@ -423,56 +453,94 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             return NOT_FOUND;
         }
 
-        // TODO: get interface name + interface index (maybe needed)
+        src_spi = sa->spi;
 
-        // TODO: hope these values are not twisted :)
+        req.tunnels = calloc(1, sizeof(Ipsec__TunnelInterfaces__Tunnel *));
+        req.tunnels[0] = &tunnel;
+        req.n_tunnels = 1;
+
+        // REVIEW: hope these values are not reversed
+        src_addr = id->src->get_address(id->src);
+        dst_addr = id->dst->get_address(id->dst);
+
+        tunnel.local_ip = strndup(src_addr.ptr,
+                                  src_addr.len);
+        tunnel.remote_ip = strndup(dst_addr.ptr,
+                                   dst_addr.len);
+
+        tunnel.has_local_spi = TRUE;
+        tunnel.local_spi = src_spi;
+
+        tunnel.has_remote_spi = TRUE;
+        tunnel.remote_spi = id->spi;
+
+        // Crypto
+        tunnel.has_crypto_alg = TRUE;
+        tunnel.crypto_alg = vpp_enc_alg;
+        // don't know if they are NULL terminated (precaution)
+        tunnel.local_crypto_key = strndup(sa->enc_key.ptr,
+                                          sa->enc_key.len);
+        tunnel.remote_crypto_key = strndup(data->enc_key.ptr,
+                                           data->enc_key.len);
+
+        // Integrity
+        tunnel.has_integ_alg = TRUE;
+        tunnel.integ_alg = vpp_int_alg;
+        // don't know if they are NULL terminated (precaution)
+        tunnel.local_integ_key = strndup(sa->int_key.ptr,
+                                         sa->int_key.len);
+        tunnel.remote_integ_key = strndup(data->int_key.ptr,
+                                          data->int_key.len);
+
+        tunnel.has_enabled = TRUE;
+        tunnel.enabled = TRUE;
+
+        // do the actual RPC call
+        rc = vac->put(vac, &req, &rsp);
+
+        free(req.tunnels);
+
+        free(sa->enc_key);
+        free(sa->int_key);
+        free(sa);
+
+        free(tunnel.local_ip);
+        free(tunnel.remote_ip);
+
+        free(tunnel.local_crypto_key);
+        free(tunnel.remote_crypto_key);
+
+        free(tunnel.local_integ_key);
+        free(tunnel.remote_integ_key);
+
+        if (rc == FAILED)
+        {
+            DBG1(DBG_KNL, "vac adding ipsec tunnel failed");
+            return FAILED;
+        }
+
+        // REVIEW: hope these values are not reversed
         INIT(tun,
-               .if_name = NULL; // we need this
-               .sw_if_index = 0; // we may need this
-               .src_spi = sa->spi,
+               .src_spi = src_spi,
                .src_addr = id->src,
                .dst_spi = id->spi,
                .dst_addr = id->dst);
 
-        free(sa);
+        if (set_tunnel_if_name(tun) == FAILED)
+        {
+            free(tun);
+            DBG1(DBG_KNEL, "tunnel interface not created");
+            return FAILED;
+        }
 
         // hash based on outbound
-
         kernel_ipsec_sa_id_t _id = {
                   .dst = data->dst,
-                  .spi = data->sa->esp.spi
-        };
-
+                  .spi = data->sa->esp.spi};
         this->mutex->lock(this->mutex);
         this->tunnels->put(this->tunnels, &_id, tun);
         this->mutex->unlock(this->mutex);
-
-        // TODO: convert values based on the requirements in the proto file
-        /* extracting keys !!
-         * this is just reference:
-
-        // crypto key
-        mp->crypto_algorithm = enc_alg;
-        mp->crypto_key_length = data->enc_key.len;
-        memcpy(mp->crypto_key, data->enc_key.ptr, data->enc_key.len);
-
-        // integrity key
-        mp->integrity_algorithm = ia;
-        mp->integrity_key_length = data->int_key.len;
-        memcpy(mp->integrity_key, data->int_key.ptr, data->int_key.len);
-        */
-
-        // promiscuous enable ?
-        // what about arp ? 
-        // set ipsec interface up ?
-        // set interface to unnumbered (based on src IP adress)
-        //  - get local interface based on src IP address then set unnumbered
-        //    for the tunnel interface (to join with the "physical interface")
-        // dump all tunnel interfaces, get ID of the tunnel interface !
- 
-        // TODO: send grpc call (create tunnel) if ok save tunnel in memory reg
     }
-
     return SUCCESS;
 }
 
