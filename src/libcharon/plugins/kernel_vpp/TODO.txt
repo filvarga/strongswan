@@ -1,0 +1,16 @@
+TODO:
+  1) match tunnel based on destination SPI & destination IP address
+  2) make decision based on test if IN SA src/dst and OUT SA src/dst are the same
+      if true then do not store host_t *src, *dst (we just wait for next OUT call)
+      !inbound
+  4) get interface name of the new created IPSEC tunnel interface
+      do we really need ipsec tunnel interface index ?
+  5) test if we can use unnumbered ipsec tunnel interface (the same as our source interface
+      address)
+    *) if yes then we need to get interface index of this physical interface so we can
+        set up unnumbered on our ipsec tunnel interace pointing to this one
+      ?? hmm
+
+  6) match inbound traffic based on inbound SPI & inbound IP
+  7) set our local interface to promiscous enable (is this really required ?)
+      - needs testing
