@@ -75,14 +75,6 @@ struct private_kernel_vpp_ipsec_t {
     bool manage_routes;
 };
 
-// interface esn - extended sequence number
-// interface replay - anti replay option
-// interface name
-// interface enabled
-// interface ip_addresses ?? (repeated, use of ?)
-//  - if we need to setup interface ip address ?
-//  interface vrf - ??
-
 /**
  * Security association entry
  */
@@ -118,51 +110,11 @@ typedef struct {
      */
     chunk_t int_key;
 
-    // TODO: review if we need to store these
-    // they may be the same - or twisted for INPUT/OUTPUT direction
-    /**
-     * Source address
-     */
-    host_t *src;
-
-    /**
-     * Destination address
-     */
-    host_t *dst;
 } sa_t;
 
 /**
  */
 typedef struct {
-    /**
-     * Gateway of route
-     */
-    // host_t *gateway;
-
-    /**
-     * References for route
-     * */
-    //int refs;
-
-    /**
-     * Destination network of route
-     */
-    host_t *dst_net;
-
-    /**
-     * Prefix length of dst_net
-     */
-    uint8_t prefixlen;
-} route_t;
-
-/**
- */
-typedef struct {
-
-    /**
-     * SPI
-     */
-    uint32_t spi;
 
     /**
      * Name of the ipsec tunnel interface
@@ -174,13 +126,47 @@ typedef struct {
      */
     uint32_t sw_if_index;
 
-    // we may not need these !
     /**
-     * Linked list of installed routes
+     * SPI
      */
-    // linked_list_t *routes;
+    uint32_t src_spi;
+
+    /**
+     * Source address
+     */
+    host_t *src_addr;
+
+    /**
+     * SPI
+     */
+    uint32_t dst_spi;
+
+    /**
+     * Destination address
+     */
+    host_t *dst_addr;
 
 } tunnel_t;
+
+/**
+ * Hash function for IPsec Tunnel Interface
+ */
+static u_int tunnel_hash(ipsec_sa_id_t *sa)
+{
+    return chunk_hash_inc(sa->dst->get_address(sa->dst),
+                          chunk_from_thing(sa->spi));
+}
+
+// we don't really need this !
+/**
+ * Equality function for IPsec Tunnel Interface
+ */
+static bool tunnel_equals(tunnel_t *one, tunnel_t *two)
+{
+    return one->src_addr->ip_equals(one->src_addr, two->src_addr) &&
+           one->dst_addr->ip_equals(one->dst_addr, two->dst_addr) &&
+           one->src_spi == two->src_spi && one->dst_spi == two->dst_spi;;
+}
 
 #define htonll(x) ((1==htonl(1)) ? (x) : ((uint64_t)htonl((x) & 0xFFFFFFFF) << 32) | htonl((x) >> 32))
 
@@ -342,6 +328,7 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
     private_kernel_vpp_ipsec_t *this, kernel_ipsec_sa_id_t *id,
     kernel_ipsec_add_sa_t *data)
 {
+    tunnel_t *tun;
     sa_t *sa;
 
     uint16_t vpp_enc_alg;
@@ -435,6 +422,30 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             DBG1(DBG_KNL, "adding outbound SA failed, missing inbound SA");
             return NOT_FOUND;
         }
+
+        // TODO: get interface name + interface index (maybe needed)
+
+        // TODO: hope these values are not twisted :)
+        INIT(tun,
+               .if_name = NULL; // we need this
+               .sw_if_index = 0; // we may need this
+               .src_spi = sa->spi,
+               .src_addr = id->src,
+               .dst_spi = id->spi,
+               .dst_addr = id->dst);
+
+        free(sa);
+
+        // hash based on outbound
+
+        kernel_ipsec_sa_id_t _id = {
+                  .dst = data->dst,
+                  .spi = data->sa->esp.spi
+        };
+
+        this->mutex->lock(this->mutex);
+        this->tunnels->put(this->tunnels, &_id, tun);
+        this->mutex->unlock(this->mutex);
 
         // TODO: convert values based on the requirements in the proto file
         /* extracting keys !!
@@ -643,7 +654,9 @@ kernel_vpp_ipsec_t *kernel_vpp_ipsec_create()
         .mutex = mutex_create(MUTEX_TYPE_DEFAULT),
         // TODO: test if hashtable_has_ptr is suitable for us !!
         .sad = hashtable_create(hashtable_hash_ptr, hashtable_equals_ptr, 4),
-        //.tunnels = linked_list_create(),
+        // we can reuse this hash for both in and out registration of (SPI + IP)
+        .tunnels = hashtable_create((hashtable_hash_t)tunnel_hash,
+                                      (hashtable_equals_t)tunnel_equals, 32),
         .routes = linked_list_create(),
         .manage_routes = lib->settings->get_bool(lib->settings,
                             "%s.install_routes", TRUE, lib->ns),
