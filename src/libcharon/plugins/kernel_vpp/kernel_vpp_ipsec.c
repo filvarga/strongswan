@@ -15,9 +15,6 @@
  */
 #include <daemon.h>
 #include <utils/debug.h>
-#include <vlibapi/api.h>
-#include <vlibmemory/api.h>
-#include <vpp/api/vpe_msg_enum.h>
 #include <collections/hashtable.h>
 #include <threading/mutex.h>
 
@@ -33,8 +30,8 @@
 typedef struct private_kernel_vpp_ipsec_t private_kernel_vpp_ipsec_t;
 
 typedef enum {
-  ADD_ROUTES,
-  DEL_ROUTES
+  ROUTE_DEL,
+  ROUTE_ADD
 } routes_op_e;
 
 /**
@@ -125,27 +122,22 @@ typedef struct {
     char *if_name;
 
     /**
-     * Index of the ipsec tunnel interface
-     */
-    uint32_t sw_if_index;
-
-    /**
-     * SPI
+     * Source(Local) SPI
      */
     uint32_t src_spi;
 
     /**
-     * Source address
-     */
-    host_t *src_addr;
-
-    /**
-     * SPI
+     * Destination(Remote) SPI
      */
     uint32_t dst_spi;
 
     /**
-     * Destination address
+     * Source(Local) IP
+     */
+    host_t *src_addr;
+
+    /**
+     * Destination(Remote) IP
      */
     host_t *dst_addr;
 
@@ -154,10 +146,10 @@ typedef struct {
 /**
  * Hash function for IPsec Tunnel Interface
  */
-static u_int tunnel_hash(ipsec_sa_id_t *sa)
+static u_int tunnel_hash(kernel_ipsec_sa_id_t *sa)
 {
-    return chunk_hash_inc(sa->dst->get_address(sa->dst),
-                          chunk_from_thing(sa->spi));
+    return chunk_hash_inc(chunk_from_thing(sa->spi),
+                          chunk_hash(sa->dst->get_address(sa->dst)));
 }
 
 // we don't use this - is it required ?! (test if we can use pointer match)
@@ -174,7 +166,7 @@ static bool tunnel_equals(tunnel_t *one, tunnel_t *two)
 /**
  * Set if_name of tunnel interface based on match
  */
-static status_t set_tunnel_if_name(tunnel_t *tun, char **if_name)
+static status_t set_tunnel_if_name(tunnel_t *tun)
 {
     // grpc trash
     Ipsec__TunnelInterfaces__Tunnel *tunnel = NULL;
@@ -182,8 +174,8 @@ static status_t set_tunnel_if_name(tunnel_t *tun, char **if_name)
     Rpc__IPSecTunnelResponse *rsp = NULL;
     //
 
-    chunk_t *srt_addr;
-    chunk_t *dst_addr;
+    chunk_t src_addr;
+    chunk_t dst_addr;
 
     int l_src, l_dst;
     status_t rc;
@@ -212,8 +204,8 @@ static status_t set_tunnel_if_name(tunnel_t *tun, char **if_name)
             if (((l_src = strlen(tunnel->local_ip)) == src_addr.len) &&
                 ((l_dst = strlen(tunnel->remote_ip)) == dst_addr.len))
             {
-                if ((strncmp(src_add.ptr, tunnel->local_ip, l_src) == 0) &&
-                    (strncmp(dst_add.ptr, tunnel->remote_ip, l_dst) == 0))
+                if ((strncmp(src_addr.ptr, tunnel->local_ip, l_src) == 0) &&
+                    (strncmp(dst_addr.ptr, tunnel->remote_ip, l_dst) == 0))
                 {
                     tun->if_name = strdup(tunnel->name);
                     return SUCCESS;
@@ -257,7 +249,7 @@ static status_t convert_enc_alg(uint16_t alg, chunk_t key, uint16_t *vpp_alg)
 
 static status_t convert_int_alg(uint16_t alg, uint16_t *vpp_alg)
 {
-    switch (data->int_alg)
+    switch (alg)
     {
         case AUTH_UNDEFINED:
             *vpp_alg = IPSEC__INTEG_ALGORITHM__NONE_INTEG;
@@ -283,20 +275,29 @@ static status_t convert_int_alg(uint16_t alg, uint16_t *vpp_alg)
     return SUCCESS;
 }
 
+static void destroy_tunnel(tunnel_t *tun)
+{
+    free(tun->if_name);
+    tun->src_addr->destroy(tun->src_addr);
+    tun->dst_addr->destroy(tun->dst_addr);
+    // loop over all hashes in TUNNEL
+    // and destroy them :D :D
+}
+
 /**
  * Add or remove a routes
  */
-static status_t manage_routes(private_kernel_vpp_ipsec_t *this,
-                              kernel_ipsec_policy_id_t *id,
-                              kernel_ipsec_manage_policy_t *data,
-                              routes_op_e op)
+static status_t vpp_add_del_route(private_kernel_vpp_ipsec_t *this,
+                                  kernel_ipsec_policy_id_t *id,
+                                  kernel_ipsec_manage_policy_t *data,
+                                  routes_op_e op)
 {
     status_t rc = SUCCESS;
     uint8_t prefixlen;
     host_t *dst_net;
     tunnel_t *tun;
 
-    if ((data-type != POLICY_IPSEC) || !data->sa ||
+    if ((data->type != POLICY_IPSEC) || !data->sa ||
         (data->sa->mode != MODE_TUNNEL))
     {
         DBG1(DBG_KNL, "usupported SA received");
@@ -305,7 +306,8 @@ static status_t manage_routes(private_kernel_vpp_ipsec_t *this,
 
     // NEEDS TESTING !!
     // we only care about POLICY_OUT routes
-    if (this->manage_routes && (id->dir == POLICY_OUT))
+
+    if (id->dir == POLICY_OUT)
     {
         kernel_ipsec_sa_id_t _id = {
                   .dst = data->dst,
@@ -323,22 +325,22 @@ static status_t manage_routes(private_kernel_vpp_ipsec_t *this,
 
         id->dst_ts->to_subnet(id->dst_ts, &dst_net, &prefixlen);
 
-        if (op == ADD_ROUTES)
+        if (op == ROUTE_ADD)
         {
             rc = charon->kernel->add_route(charon->kernel, dst_net->get_address(
                                            dst_net), prefixlen, data->dst, NULL,
-                                           tunnel->if_name);
+                                           tun->if_name);
         }
         else
         {
             rc = charon->kernel->del_route(charon->kernel, dst_net->get_address(
                                            dst_net), prefixlen, data->dst, NULL,
-                                           tunnel->if_name);
+                                           tun->if_name);
         }
-        DBG2(DBG_NKL, "(%s) %s route %H/%d via tunnel interface %s",
+        DBG2(DBG_KNL, "(%s) %s route %H/%d via tunnel interface %s",
                  rc == SUCCESS ? "success" : "failure",
-                 op == ADD_ROUTES ? "add" : "del",
-                 dst_net, prefixlen, tunnel->if_name);
+                 op == ROUTE_ADD ? "add" : "del",
+                 dst_net, prefixlen, tun->if_name);
 
     }
     // well i don't know how the upper layer behaves - figure out next thing to do
@@ -365,15 +367,15 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 
     uint32_t src_spi;
 
-    chunk_t *src_addr;
-    chunk_t *dst_addr;
+    chunk_t src_addr;
+    chunk_t dst_addr;
 
     if (data->mode != MODE_TUNNEL)
     {
         return NOT_SUPPORTED;
     }
 
-    rc = convert_enc_alg(data->enc_alg, data->enc_key, &vpp_enc_alg)
+    rc = convert_enc_alg(data->enc_alg, data->enc_key, &vpp_enc_alg);
     if (rc != SUCCESS)
     {
         DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
@@ -395,8 +397,8 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
               .spi = id->spi,
               .vpp_enc_alg = vpp_enc_alg,
               .vpp_int_alg = vpp_int_alg,
-              .enc_key = data->enc_key->chunk_clone(data->enc_key),
-              .int_key = data->int_key->chunk_clone(data->int_key));
+              .enc_key = chunk_clone(data->enc_key),
+              .int_key = chunk_clone(data->int_key));
 
         // reqid is unique for each entry (2xSA + SP)
         this->mutex->lock(this->mutex);
@@ -462,10 +464,6 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 
         free(req.tunnels);
 
-        free(sa->enc_key);
-        free(sa->int_key);
-        free(sa);
-
         free(tunnel.local_ip);
         free(tunnel.remote_ip);
 
@@ -474,6 +472,13 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 
         free(tunnel.local_integ_key);
         free(tunnel.remote_integ_key);
+
+        // strongswan specific:
+        // TODO: how to clean if required
+        //chunk_free(sa->enc_key);
+        //chunk_free(sa->int_key);
+
+        free(sa);
 
         if (rc == FAILED)
         {
@@ -484,14 +489,14 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
         // REVIEW: hope these values are not reversed
         INIT(tun,
                .src_spi = src_spi,
-               .src_addr = id->src,
+               .src_addr = id->src->clone(id->src),
                .dst_spi = id->spi,
-               .dst_addr = id->dst);
+               .dst_addr = id->dst->clone(id->dst));
 
         if (set_tunnel_if_name(tun) == FAILED)
         {
             free(tun);
-            DBG1(DBG_KNEL, "tunnel interface not created");
+            DBG1(DBG_KNL, "tunnel interface not created");
             return FAILED;
         }
 
@@ -531,14 +536,22 @@ METHOD(kernel_ipsec_t, add_policy, status_t,
     private_kernel_vpp_ipsec_t *this, kernel_ipsec_policy_id_t *id,
     kernel_ipsec_manage_policy_t *data)
 {
-    return manage_routes(this, id, data, ADD_ROUTES);
+    if (this->manage_routes)
+    {
+        return vpp_add_del_route(this, id, data, ROUTE_ADD);
+    }
+    return SUCCESS;
 }
 
 METHOD(kernel_ipsec_t, del_policy, status_t,
     private_kernel_vpp_ipsec_t *this, kernel_ipsec_policy_id_t *id,
     kernel_ipsec_manage_policy_t *data)
 {
-    return manage_routes(this, id, data, DEL_ROUTES);
+    if (this->manage_routes)
+    {
+        return vpp_add_del_route(this, id, data, ROUTE_DEL);
+    }
+    return SUCCESS;
 }
 
 // TODO: grpc vpp-agent return counters from tunnel interface
@@ -607,8 +620,9 @@ METHOD(kernel_ipsec_t, get_spi, status_t,
 METHOD(kernel_ipsec_t, destroy, void,
     private_kernel_vpp_ipsec_t *this)
 {
+    // to do free operations ! for strdup strings and so on
     this->mutex->destroy(this->mutex);
-    this->routes->destroy(this->routes);
+    this->tunnels->destroy(this->tunnels);
     this->sad->destroy(this->sad);
     free(this);
 }
@@ -690,7 +704,6 @@ kernel_vpp_ipsec_t *kernel_vpp_ipsec_create()
         // we can reuse this hash for both in and out registration of (SPI + IP)
         .tunnels = hashtable_create((hashtable_hash_t)tunnel_hash,
                                       (hashtable_equals_t)tunnel_equals, 32),
-        .routes = linked_list_create(),
         .manage_routes = lib->settings->get_bool(lib->settings,
                             "%s.install_routes", TRUE, lib->ns),
     );
