@@ -25,6 +25,9 @@
 #include "kernel_vpp_ipsec.h"
 #include "kernel_vpp_grpc.h"
 
+// aren't they already included ?
+#include <string.h>
+
 #define PRIO_BASE 384
 
 typedef struct private_kernel_vpp_ipsec_t private_kernel_vpp_ipsec_t;
@@ -157,7 +160,7 @@ static u_int tunnel_hash(ipsec_sa_id_t *sa)
                           chunk_from_thing(sa->spi));
 }
 
-// we don't really need this !
+// we don't use this - is it required ?! (test if we can use pointer match)
 /**
  * Equality function for IPsec Tunnel Interface
  */
@@ -169,50 +172,20 @@ static bool tunnel_equals(tunnel_t *one, tunnel_t *two)
 }
 
 /**
- * Get sw_if_index from interface name
- */
-static status_t get_sw_if_index(char *name, uint32_t **if_index)
-{
-    Interfaces__InterfacesState__Interface if_state;
-    Rpc__DumpRequest rq = RPC__DUMP_REQUEST__INIT;
-    Rpc__InterfaceResponse *rp;
-    status_t rc;
-    size_t n;
-
-    rc = vac->dump_interfaces_state(vac, &rq, &rp);
-    if (rc == SUCCESS)
-    {
-        n = rp->n_interfaces;
-        while (n--)
-        {
-            if_state = rp->interfaces[n];
-            if (strcmp(name, if_state->name) == 0)
-            {
-                if (if_state->has_if_index)
-                {
-                    *if_index = if_state->if_index;
-                    return SUCCESS;
-                }
-                break;
-            }
-        }
-    }
-    return FAILED;
-}
-
-/**
  * Set if_name of tunnel interface based on match
  */
 static status_t set_tunnel_if_name(tunnel_t *tun, char **if_name)
 {
     // grpc trash
     Ipsec__TunnelInterfaces__Tunnel *tunnel = NULL;
-
     Rpc__DumpRequest req = RPC__DUMP_REQUEST__INIT;
     Rpc__IPSecTunnelResponse *rsp = NULL;
     //
 
-    // tun->if_name = strdup(...);
+    chunk_t *srt_addr;
+    chunk_t *dst_addr;
+
+    int l_src, l_dst;
     status_t rc;
     size_t n;
 
@@ -220,24 +193,94 @@ static status_t set_tunnel_if_name(tunnel_t *tun, char **if_name)
     if (rc == SUCCESS)
     {
         n = rsp->n_tunnels;
+
         while (n--)
         {
             tunnel = rsp->tunnels[n];
 
-            // TODO: finish the matching algo (local (SPI + IP), remote (SPI + IP))
-
-            if (strcmp(name, if_state->name) == 0)
+            if (!tunnel->local_ip || !tunnel->remote_ip ||
+                (tunnel->local_spi != tun->src_spi) ||
+                (tunnel->remote_spi != tun->dst_spi))
             {
-                if (if_state->has_if_index)
+                continue;
+            }
+
+            // is chunk 0 terminated ?
+            src_addr = tun->src_addr->get_address(tun->src_addr);
+            dst_addr = tun->dst_addr->get_address(tun->dst_addr);
+
+            if (((l_src = strlen(tunnel->local_ip)) == src_addr.len) &&
+                ((l_dst = strlen(tunnel->remote_ip)) == dst_addr.len))
+            {
+                if ((strncmp(src_add.ptr, tunnel->local_ip, l_src) == 0) &&
+                    (strncmp(dst_add.ptr, tunnel->remote_ip, l_dst) == 0))
                 {
-                    *if_name = if_state->if_name;
+                    tun->if_name = strdup(tunnel->name);
                     return SUCCESS;
                 }
-                break;
             }
         }
     }
     return FAILED;
+}
+
+/* ENCR_3DES (4) NOT supported in proto definition */
+static status_t convert_enc_alg(uint16_t alg, chunk_t key, uint16_t *vpp_alg)
+{
+    if (ENCR_NULL == alg)
+    {
+        *vpp_alg = IPSEC__CRYPTO_ALGORITHM__NONE_CRYPTO;
+    }
+    else if (ENCR_AES_CBC == alg)
+    {
+        switch (key.len * 8)
+        {
+            case 128:
+                *vpp_alg = IPSEC__CRYPTO_ALGORITHM__AES_CBC_128;
+                break;
+            case 192:
+                *vpp_alg = IPSEC__CRYPTO_ALGORITHM__AES_CBC_192;
+                break;
+            case 256:
+                *vpp_alg = IPSEC__CRYPTO_ALGORITHM__AES_CBC_256;
+                break;
+            default:
+                return FAILED;
+        }
+    }
+    else
+    {
+        return FAILED;
+    }
+    return SUCCESS;
+}
+
+static status_t convert_int_alg(uint16_t alg, uint16_t *vpp_alg)
+{
+    switch (data->int_alg)
+    {
+        case AUTH_UNDEFINED:
+            *vpp_alg = IPSEC__INTEG_ALGORITHM__NONE_INTEG;
+            break;
+        case AUTH_HMAC_MD5_96:
+            *vpp_alg = IPSEC__INTEG_ALGORITHM__MD5_96;
+            break;
+        case AUTH_HMAC_SHA1_96:
+            *vpp_alg = IPSEC__INTEG_ALGORITHM__SHA1_96;
+            break;
+        case AUTH_HMAC_SHA2_256_128:
+            *vpp_alg = IPSEC__INTEG_ALGORITHM__SHA_256_128;
+            break;
+        case AUTH_HMAC_SHA2_384_192:
+            *vpp_alg = IPSEC__INTEG_ALGORITHM__SHA_384_192;
+            break;
+        case AUTH_HMAC_SHA2_512_256:
+            *vpp_alg = IPSEC__INTEG_ALGORITHM__SHA_512_256;
+            break;
+        default:
+            return FAILED;
+    }
+    return SUCCESS;
 }
 
 /**
@@ -248,96 +291,59 @@ static status_t manage_routes(private_kernel_vpp_ipsec_t *this,
                               kernel_ipsec_manage_policy_t *data,
                               routes_op_e op)
 {
-    status_t rv = FAILED;
+    status_t rc = SUCCESS;
     uint8_t prefixlen;
     host_t *dst_net;
-    host_t *gateway; // do we need this ?
-    char *if_name; // do we need this ?
+    tunnel_t *tun;
 
-    // REVIEW: logic - add routes only if we support it
-
-    if ((data-type != POLICY_IPSEC) || !data->sa)
+    if ((data-type != POLICY_IPSEC) || !data->sa ||
+        (data->sa->mode != MODE_TUNNEL))
     {
+        DBG1(DBG_KNL, "usupported SA received");
         return NOT_SUPPORTED;
     }
 
-    if (data->sa->mode != MODE_TUNNEL)
-    {
-        return NOT_SUPPORTED;
-    }
-
-    // change this!
-    this->mutex->lock(this->mutex);
-    tunnel = this->tunnels->get(this->tunnels,
-                                (void *)(uintptr_t)data->sa->reqid);
-    if (!tunnel)
-    {
-        // tunnel is missing we won't add routes WHY would we ?
-        DBG1(DBG_KNL, "tunnel missing");
-        goto error;
-    }
-
+    // NEEDS TESTING !!
     // we only care about POLICY_OUT routes
     if (this->manage_routes && (id->dir == POLICY_OUT))
     {
+        kernel_ipsec_sa_id_t _id = {
+                  .dst = data->dst,
+                  .spi = data->sa->esp.spi};
 
-      // WHY ? WHY ? (and non fatal also in the previous code)
-      if (data->dst->is_anyaddr(dst))
-      {
-          goto error;
-      }
+        this->mutex->lock(this->mutex);
+        tun = this->tunnels->get(this->tunnels, &_id);
+        this->mutex->unlock(this->mutex);
 
-      // TODO: we need to know the actual IP address of the "gateway"
-      // and the name of the tunnel interface
-      // these will be stored in the tunnel !!
-      // there is one thing to consider:
-      // SAs have: (kernel_ipsec_add_sa_t -> data)
-      //  linked_list_t *src_ts; // List of source traffic selectors
-      //  linked_list_t *dst_ts; // List of destinatoin traffic selectors
-      // SPs have: (kernel_ipsec_policy_id_t -> id)
-      //  traffic_selector_t *src_ts; // Source traffic selector
-      //  traffic_selector_t *dst_ts; // Destination traffic selector
-      //
-      // how are these related ?!
-      // if those hold same data we could definitely stop wasting time with
-      // policy calls (we won't need them)
+        if (!tun)
+        {
+            DBG1(DBG_KNL, "tunnel missing can't add routes");
+            return FAILED;
+        }
 
-      id->dst_ts->to_subnet(id->dst_ts, &dst_net, &prefixlen);
+        id->dst_ts->to_subnet(id->dst_ts, &dst_net, &prefixlen);
 
-      gateway = charon->kernel->get_nexthop(charon->kernel, data->dst, -1, NULL, &if_name);
+        if (op == ADD_ROUTES)
+        {
+            rc = charon->kernel->add_route(charon->kernel, dst_net->get_address(
+                                           dst_net), prefixlen, data->dst, NULL,
+                                           tunnel->if_name);
+        }
+        else
+        {
+            rc = charon->kernel->del_route(charon->kernel, dst_net->get_address(
+                                           dst_net), prefixlen, data->dst, NULL,
+                                           tunnel->if_name);
+        }
+        DBG2(DBG_NKL, "(%s) %s route %H/%d via tunnel interface %s",
+                 rc == SUCCESS ? "success" : "failure",
+                 op == ADD_ROUTES ? "add" : "del",
+                 dst_net, prefixlen, tunnel->if_name);
 
-      // as stated in the source code doc:
-      // kernel_ipsec_manage_policy_t dst is 
-      // Destination address of the SA(s) tied to this policy
-      // so we know it is the same we don't need to store it
-
-      if (op == ADD_ROUTES)
-      {
-        
-        DBG2(DBG_NKL, "add route %H/%d via %H on dev %s",
-             dst_net, prefixlen, gateway, tunnel->if_name);
-
-        // TODO: should we process response of this operation ?
-        charon->kernel->add_route(charon->kernel,
-            dst_net->get_address(dst_net), prefixlen, 
-            data->dst, NULL, tunnel->if_name);
-      }
-      else
-      {
-        DBG2(DBG_NKL, "del route %H/%d via %H on dev %s",
-             dst_net, prefixlen, gateway, tunnel->if_name);
-
-        // TODO: should we process response of this operation ?
-        charon->kernel->del_route(charon->kernel,
-            dst_net->get_address(dst_net), prefixlen,
-            data->dst, NULL, tunnel->if_name);
-      }
     }
-      
-    rv = SUCCESS;
-error:
-    this->mutex->unlock(this->mutex);
-    return rv;
+    // well i don't know how the upper layer behaves - figure out next thing to do
+    // so the return values match the behavior we need
+    return rc;
 }
 
 METHOD(kernel_ipsec_t, add_sa, status_t,
@@ -346,7 +352,6 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 {
     // grpc trash
     Ipsec__TunnelInterfaces__Tunnel tunnel = IPSEC__TUNNEL_INTERFACES__TUNNEL__INIT;
-
     Rpc__DataRequest req = RPC__DATA_REQUEST__INIT;
     Rpc__PutResponse *rsp = NULL;
     //
@@ -368,65 +373,22 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
         return NOT_SUPPORTED;
     }
 
-    /* ENCR_3DES (4) NOT supported in proto definition */
-
-    // TODO: convert to function/macro
-    if (ENCR_NULL == data->enc_alg)
-    {
-        vpp_enc_alg = IPSEC__CRYPTO_ALGORITHM__NONE_CRYPTO;
-    }
-    else if (ENCR_AES_CBC == data->enc_alg)
-    {
-        switch (data->enc_key.len * 8)
-        {
-            case 128:
-                vpp_enc_alg = IPSEC__CRYPTO_ALGORITHM__AES_CBC_128;
-                break;
-            case 192:
-                vpp_enc_alg = IPSEC__CRYPTO_ALGORITHM__AES_CBC_192;
-                break;
-            case 256:
-                vpp_enc_alg = IPSEC__CRYPTO_ALGORITHM__AES_CBC_256;
-                break;
-            default:
-                return FAILED;
-        }
-    }
-    else
+    rc = convert_enc_alg(data->enc_alg, data->enc_key, &vpp_enc_alg)
+    if (rc != SUCCESS)
     {
         DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
              encryption_algorithm_names, data->enc_alg);
         return FAILED;
     }
 
-    // TODO: convert to function/macro
-    switch (data->int_alg)
+    rc = convert_int_alg(data->int_alg, &vpp_int_alg);
+    if (rc != SUCCESS)
     {
-        case AUTH_UNDEFINED:
-            vpp_int_alg = IPSEC__INTEG_ALGORITHM__NONE_INTEG;
-            break;
-        case AUTH_HMAC_MD5_96:
-            vpp_int_alg = IPSEC__INTEG_ALGORITHM__MD5_96;
-            break;
-        case AUTH_HMAC_SHA1_96:
-            vpp_int_alg = IPSEC__INTEG_ALGORITHM__SHA1_96;
-            break;
-        case AUTH_HMAC_SHA2_256_128:
-            vpp_int_alg = IPSEC__INTEG_ALGORITHM__SHA_256_128;
-            break;
-        case AUTH_HMAC_SHA2_384_192:
-            vpp_int_alg = IPSEC__INTEG_ALGORITHM__SHA_384_192;
-            break;
-        case AUTH_HMAC_SHA2_512_256:
-            vpp_int_alg = IPSEC__INTEG_ALGORITHM__SHA_512_256;
-            break;
-        default:
-            DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
-                 integrity_algorithm_names, data->int_alg);
-            return FAILED;
+        DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
+             integrity_algorithm_names, data->int_alg);
     }
 
-    // inbound comes first
+    // inbound SA comes first
     if (data->inbound)
     {
         INIT(sa,
@@ -438,13 +400,13 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 
         // reqid is unique for each entry (2xSA + SP)
         this->mutex->lock(this->mutex);
-        this->sad->put(this->sad, (void *)(uintptr_t)data->reqid, sa); // typecast?
+        this->sad->put(this->sad, (void *)(uintptr_t)data->reqid, sa);
         this->mutex->unlock(this->mutex);
     }
     else
     {
         this->mutex->lock(this->mutex);
-        sa = this->sad->remove(this->sad, (void *)(uintptr_t)data->reqid); // typecast?
+        sa = this->sad->remove(this->sad, (void *)(uintptr_t)data->reqid);
         this->mutex->unlock(this->mutex);
 
         if (!sa)
@@ -533,10 +495,13 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             return FAILED;
         }
 
-        // hash based on outbound
+        // hash based on outbound, we should also hash it based
+        // on inbound so we can lookup from both SPs comming in
+        // two hashes required though
         kernel_ipsec_sa_id_t _id = {
-                  .dst = data->dst,
-                  .spi = data->sa->esp.spi};
+                  .dst = id->dst,
+                  .spi = id->spi};
+
         this->mutex->lock(this->mutex);
         this->tunnels->put(this->tunnels, &_id, tun);
         this->mutex->unlock(this->mutex);

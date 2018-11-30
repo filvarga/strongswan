@@ -14,3 +14,26 @@ TODO:
   6) match inbound traffic based on inbound SPI & inbound IP
   7) set our local interface to promiscous enable (is this really required ?)
       - needs testing
+
+NOTES:
+        // do we need to know the actual IP address of the "gateway" ?
+        // and what about the name of the tunnel interface ?
+        // these will be stored in the tunnel !!
+        // there is one thing to consider:
+        // SAs have: (kernel_ipsec_add_sa_t -> data)
+        //  linked_list_t *src_ts; // List of source traffic selectors
+        //  linked_list_t *dst_ts; // List of destinatoin traffic selectors
+        // SPs have: (kernel_ipsec_policy_id_t -> id)
+        //  traffic_selector_t *src_ts; // Source traffic selector
+        //  traffic_selector_t *dst_ts; // Destination traffic selector
+        //
+        // how are these related ?!
+        // if those hold same data we could definitely stop wasting time with
+        // policy calls (we won't need them)
+
+
+INFO:
+        // as stated in the source code doc:
+        // kernel_ipsec_manage_policy_t dst is
+        // Destination address of the SA(s) tied to this policy
+        // so we know it is the same we don't need to store it
