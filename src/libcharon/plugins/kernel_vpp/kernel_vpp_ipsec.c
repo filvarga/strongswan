@@ -177,7 +177,10 @@ static status_t set_tunnel_if_name(tunnel_t *tun)
     {
         n = rsp->n_tunnels;
 
-        while (n--)
+        src_addr = tun->src_addr->get_address(tun->src_addr);
+        dst_addr = tun->dst_addr->get_address(tun->dst_addr);
+
+        for (n = 0; n < rsp->n_tunnels; n++)
         {
             tunnel = rsp->tunnels[n];
 
@@ -187,10 +190,6 @@ static status_t set_tunnel_if_name(tunnel_t *tun)
             {
                 continue;
             }
-
-            // is chunk 0 terminated ?
-            src_addr = tun->src_addr->get_address(tun->src_addr);
-            dst_addr = tun->dst_addr->get_address(tun->dst_addr);
 
             if (((l_src = strlen(tunnel->local_ip)) == src_addr.len) &&
                 ((l_dst = strlen(tunnel->remote_ip)) == dst_addr.len))
