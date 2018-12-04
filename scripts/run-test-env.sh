@@ -53,16 +53,83 @@ max-concurrent-streams: 0
 EOF
 }
 
-docker network create --driver=bridge --gateway=172.16.0.1 --subnet=172.16.0.0/24 dev-net
+# TODO: as sudo
+responder_conf() {
+  mkdir -p /tmp/responder
+  cat << EOF > /tmp/responder/ipsec.conf
+conn gateway
+# defaults?
+  auto=add
+  compress=no
+  fragmentation=yes
+  forceencaps=yes
 
-docker run --net=dev-net --ip=$KAFKA_ADDRESS -d --name kafka --rm --env ADVERTISED_HOST=$KAFKA_ADDRESS --env ADVERTISED_PORT=$KAFKA_PORT spotify/kafka
+  type=tunnel
+  keyexchange=ikev2
+  ike=aes256-sha1-modp2048
+  esp=aes192-sha1-esn!
+  
+# local:
+  left=172.16.0.2
+  leftauth=psk
+  leftsubnet=0.0.0.0/0
 
-docker run --net=dev-net --ip=$ETCD_ADDRESS -d --name etcd --rm quay.io/coreos/etcd:v3.1.0 /usr/local/bin/etcd -advertise-client-urls http://$ETCD_ADDRESS:$ETCD_PORT -listen-client-urls http://$ETCD_ADDRESS:$ETCD_PORT
+# remote: (roadwarrior)
+  rightauth=psk 
+EOF
+  cat << EOF > /tmp/responder/ipsec.secrets
+: PSK "Vpp123"
+EOF
+}
 
-kafka_conf
-etcd_conf
-grpc_conf
+initiator_conf() {
+  mkdir -p /tmp/initiator
+  cat << EOF > /tmp/initiator/ipsec.conf
+conn roadwarrior
+# defaults?
+  auto=add
+  compress=no
+  fragmentation=yes
+  forceencaps=yes
 
-sleep 2
-docker run --net=dev-net --ip=$GRPC_ADDRESS -p 9111:9111  --privileged -it --name vpp --rm -v $AGENT_CFG_DIR:/opt/vpp-agent/dev ligato/vpp-agent
+  type=tunnel
+  keyexchange=ikev2
+  ike=aes256-sha1-modp2048
+  esp=aes192-sha1-esn!
+
+# local:
+  leftauth=psk  
+
+# remote: (gateway)
+  right=172.16.0.2
+  rightauth=psk
+EOF
+  cat << EOF > /tmp/initiator/ipsec.secrets
+: PSK "Vpp123"
+EOF
+}
+
+responder_conf
+initiator_conf
+
+#docker network create --driver=bridge --gateway=172.16.0.10 --subnet=172.16.0.0/24 dev-net
+
+docker run --name responder -p 501:500 -p 171:170 -p 4501:4500 --net=dev-net --ip=172.16.0.2 -d --rm --privileged -v /tmp/responder:/etc/ipsec.d philplckthun/strongswan
+
+docker run --name initiator -p 502:500 -p 172:170 -p 4502:4500 --net=dev-net --ip=172.16.0.1 -d --rm --privileged -v /tmp/initiator:/etc/ipsec.d philplckthun/strongswan
+
+# docker exec -i -t initiator /bin/bash
+
+# docker run --net=dev-net --ip=172.16.0.1 --name roadwarrior --name strongswan -d --privileged --net=host -v /etc/ipsec.d:/etc/ipsec.d mberner/strongswan:v2
+
+#docker run --net=dev-net --ip=$KAFKA_ADDRESS -d --name kafka --rm --env ADVERTISED_HOST=$KAFKA_ADDRESS --env ADVERTISED_PORT=$KAFKA_PORT spotify/kafka
+
+#docker run --net=dev-net --ip=$ETCD_ADDRESS -d --name etcd --rm quay.io/coreos/etcd:v3.1.0 /usr/local/bin/etcd -advertise-client-urls http://$ETCD_ADDRESS:$ETCD_PORT -listen-client-urls http://$ETCD_ADDRESS:$ETCD_PORT
+
+#kafka_conf
+#etcd_conf
+#grpc_conf
+
+#sleep 2
+#docker run --net=dev-net --ip=$GRPC_ADDRESS -p 9111:9111  --privileged -it --name vpp --rm -v $AGENT_CFG_DIR:/opt/vpp-agent/dev ligato/vpp-agent
 
