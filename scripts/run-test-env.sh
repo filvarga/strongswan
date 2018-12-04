@@ -114,32 +114,32 @@ EOF
 EOF
 }
 
-responder_conf
-initiator_conf
+#responder_conf
+#initiator_conf
 
 #docker network create --driver=bridge --gateway=172.16.0.10 --subnet=172.16.0.0/24 dev-net
 
-docker run --name responder -p 501:500 -p 171:170 -p 4501:4500 --net=dev-net --ip=172.16.0.2 -d --rm --privileged -v /tmp/responder:/etc/ipsec.d philplckthun/strongswan
+#docker run --name responder -p 501:500 -p 171:170 -p 4501:4500 --net=dev-net --ip=172.16.0.2 -d --rm --privileged -v /tmp/responder:/etc/ipsec.d philplckthun/strongswan
 
-docker exec responder ip tuntap add dev tap0 mode tap
-docker exec responder ip addr add 10.10.10.1/24 dev tap0
+#docker exec responder ip tuntap add dev tap0 mode tap
+#docker exec responder ip addr add 10.10.10.1/24 dev tap0
 
-docker run --name initiator -p 502:500 -p 172:170 -p 4502:4500 --net=dev-net --ip=172.16.0.1 -d --rm --privileged -v /tmp/initiator:/etc/ipsec.d philplckthun/strongswan
+#docker run --name initiator -p 502:500 -p 172:170 -p 4502:4500 --net=dev-net --ip=172.16.0.1 -d --rm --privileged -v /tmp/initiator:/etc/ipsec.d philplckthun/strongswan
 
-docker exec initiator ipsec up roadwarrior
+#docker exec initiator ipsec up roadwarrior
 
 # docker exec -i -t initiator /bin/bash
 
 # docker run --net=dev-net --ip=172.16.0.1 --name roadwarrior --name strongswan -d --privileged --net=host -v /etc/ipsec.d:/etc/ipsec.d mberner/strongswan:v2
 
-#docker run --net=dev-net --ip=$KAFKA_ADDRESS -d --name kafka --rm --env ADVERTISED_HOST=$KAFKA_ADDRESS --env ADVERTISED_PORT=$KAFKA_PORT spotify/kafka
+docker run --net=dev-net --ip=$KAFKA_ADDRESS -d --name kafka --rm --env ADVERTISED_HOST=$KAFKA_ADDRESS --env ADVERTISED_PORT=$KAFKA_PORT spotify/kafka
 
-#docker run --net=dev-net --ip=$ETCD_ADDRESS -d --name etcd --rm quay.io/coreos/etcd:v3.1.0 /usr/local/bin/etcd -advertise-client-urls http://$ETCD_ADDRESS:$ETCD_PORT -listen-client-urls http://$ETCD_ADDRESS:$ETCD_PORT
+docker run --net=dev-net --ip=$ETCD_ADDRESS -d --name etcd --rm quay.io/coreos/etcd:v3.1.0 /usr/local/bin/etcd -advertise-client-urls http://$ETCD_ADDRESS:$ETCD_PORT -listen-client-urls http://$ETCD_ADDRESS:$ETCD_PORT
 
-#kafka_conf
-#etcd_conf
-#grpc_conf
+kafka_conf
+etcd_conf
+grpc_conf
 
-#sleep 2
-#docker run --net=dev-net --ip=$GRPC_ADDRESS -p 9111:9111  --privileged -it --name vpp --rm -v $AGENT_CFG_DIR:/opt/vpp-agent/dev ligato/vpp-agent
+sleep 2
+docker run --net=dev-net --ip=$GRPC_ADDRESS -p 9111:9111  --privileged -it --name vpp --rm -v $AGENT_CFG_DIR:/opt/vpp-agent/dev ligato/vpp-agent
 

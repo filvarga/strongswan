@@ -22,7 +22,6 @@
 #include "kernel_vpp_ipsec.h"
 #include "kernel_vpp_grpc.h"
 
-// aren't they already included ?
 #include <string.h>
 
 #define PRIO_BASE 384
@@ -79,11 +78,6 @@ struct private_kernel_vpp_ipsec_t {
  * Security association entry
  */
 typedef struct {
-
-    /**
-     * unique request ID (2xSA + SP)
-     */
-    // uint32_t reqid;
 
     /**
      * SPI
@@ -152,7 +146,7 @@ static u_int tunnel_hash(kernel_ipsec_sa_id_t *sa)
                           chunk_hash(sa->dst->get_address(sa->dst)));
 }
 
-// we don't use this - is it required ?! (test if we can use pointer match)
+// we don't use this - remove ?! (test if we can use pointer match)
 /**
  * Equality function for IPsec Tunnel Interface
  */
@@ -161,6 +155,38 @@ static bool tunnel_equals(tunnel_t *one, tunnel_t *two)
     return one->src_addr->ip_equals(one->src_addr, two->src_addr) &&
            one->dst_addr->ip_equals(one->dst_addr, two->dst_addr) &&
            one->src_spi == two->src_spi && one->dst_spi == two->dst_spi;;
+}
+/**
+ * Get sw_if_name from interface name
+ * TODO: return strduped name of the interface by local ip
+ */
+static status_t get_sw_if_name(char *name, uint32_t **if_index)
+{
+    Interfaces__InterfacesState__Interface if_state;
+    Rpc__DumpRequest rq = RPC__DUMP_REQUEST__INIT;
+    Rpc__InterfaceResponse *rp;
+    status_t rc;
+    size_t n;
+
+    rc = vac->dump_interfaces_state(vac, &rq, &rp);
+    if (rc == SUCCESS)
+    {
+        n = rp->n_interfaces;
+        while (n--)
+        {
+            if_state = rp->interfaces[n];
+            if (strcmp(name, if_state->name) == 0)
+            {
+                if (if_state->has_if_index)
+                {
+                    *if_index = if_state->if_index;
+                    return SUCCESS;
+                }
+                break;
+            }
+        }
+      return FAILED;
+    }
 }
 
 /**
@@ -280,8 +306,8 @@ static void destroy_tunnel(tunnel_t *tun)
     free(tun->if_name);
     tun->src_addr->destroy(tun->src_addr);
     tun->dst_addr->destroy(tun->dst_addr);
-    // loop over all hashes in TUNNEL
-    // and destroy them :D :D
+    // TODO: loop over all hashes in TUNNEL
+    // free tunnel interface name
 }
 
 /**
@@ -459,6 +485,9 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
         tunnel.has_enabled = TRUE;
         tunnel.enabled = TRUE;
 
+        // TODO: get interface name based on local IP
+        // tunnel.unnumbered =
+
         // do the actual RPC call
         rc = vac->put(vac, &req, &rsp);
 
@@ -502,7 +531,8 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 
         // hash based on outbound, we should also hash it based
         // on inbound so we can lookup from both SPs comming in
-        // two hashes required though
+        // two hashes required though (do we really need it,
+        // prev version ignored other than POLICY_OUT)
         kernel_ipsec_sa_id_t _id = {
                   .dst = id->dst,
                   .spi = id->spi};
@@ -620,7 +650,7 @@ METHOD(kernel_ipsec_t, get_spi, status_t,
 METHOD(kernel_ipsec_t, destroy, void,
     private_kernel_vpp_ipsec_t *this)
 {
-    // to do free operations ! for strdup strings and so on
+    // TODO: free operations ! for strdup strings and so on
     this->mutex->destroy(this->mutex);
     this->tunnels->destroy(this->tunnels);
     this->sad->destroy(this->sad);
