@@ -156,37 +156,39 @@ static bool tunnel_equals(tunnel_t *one, tunnel_t *two)
            one->dst_addr->ip_equals(one->dst_addr, two->dst_addr) &&
            one->src_spi == two->src_spi && one->dst_spi == two->dst_spi;;
 }
+
 /**
- * Get sw_if_name from interface name
- * TODO: return strduped name of the interface by local ip
+ * Get interface name by ip
  */
-static status_t get_sw_if_name(char *name, uint32_t **if_index)
+static status_t get_sw_if_name(char *ip, char **if_name)
 {
-    Interfaces__InterfacesState__Interface if_state;
     Rpc__DumpRequest rq = RPC__DUMP_REQUEST__INIT;
+    Interfaces__Interfaces__Interface *iface;  
     Rpc__InterfaceResponse *rp;
     status_t rc;
-    size_t n;
 
-    rc = vac->dump_interfaces_state(vac, &rq, &rp);
+    size_t n_if, n_ip;
+
+    rc = vac->dump_interfaces(vac, &rq, &rp);
     if (rc == SUCCESS)
     {
-        n = rp->n_interfaces;
-        while (n--)
+        n_if = rp->n_interfaces;
+        while (n_if--)
         {
-            if_state = rp->interfaces[n];
-            if (strcmp(name, if_state->name) == 0)
+            iface = rp->interfaces[n];
+            
+            n_ip = iface->n_ip_address;
+            while (n_ip--)
             {
-                if (if_state->has_if_index)
+                if (strcmp(ip, iface->ip_addresses[n_ip]) == 0)
                 {
-                    *if_index = if_state->if_index;
+                    *if_name = strdup(iface->name);
                     return SUCCESS;
                 }
-                break;
             }
         }
-      return FAILED;
     }
+    return FAILED;
 }
 
 /**
@@ -306,8 +308,6 @@ static void destroy_tunnel(tunnel_t *tun)
     free(tun->if_name);
     tun->src_addr->destroy(tun->src_addr);
     tun->dst_addr->destroy(tun->dst_addr);
-    // TODO: loop over all hashes in TUNNEL
-    // free tunnel interface name
 }
 
 /**
@@ -330,8 +330,7 @@ static status_t vpp_add_del_route(private_kernel_vpp_ipsec_t *this,
         return NOT_SUPPORTED;
     }
 
-    // NEEDS TESTING !!
-    // we only care about POLICY_OUT routes
+    // we only care about POLICY_OUT routes !!
 
     if (id->dir == POLICY_OUT)
     {
@@ -369,8 +368,6 @@ static status_t vpp_add_del_route(private_kernel_vpp_ipsec_t *this,
                  dst_net, prefixlen, tun->if_name);
 
     }
-    // well i don't know how the upper layer behaves - figure out next thing to do
-    // so the return values match the behavior we need
     return rc;
 }
 
@@ -395,6 +392,8 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 
     chunk_t src_addr;
     chunk_t dst_addr;
+
+    char *if_name;
 
     if (data->mode != MODE_TUNNEL)
     {
@@ -445,11 +444,12 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 
         src_spi = sa->spi;
 
-        req.tunnels = calloc(1, sizeof(Ipsec__TunnelInterfaces__Tunnel *));
-        req.tunnels[0] = &tunnel;
-        req.n_tunnels = 1;
+        if (!charon->kernel->get_interface_name(charon->kernel, id->src, &if_name))
+        {
+            free(sa);
+            return FAILED;
+        }
 
-        // REVIEW: hope these values are not reversed
         src_addr = id->src->get_address(id->src);
         dst_addr = id->dst->get_address(id->dst);
 
@@ -457,6 +457,8 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
                                   src_addr.len);
         tunnel.remote_ip = strndup(dst_addr.ptr,
                                    dst_addr.len);
+
+        tunnel.unnumbered = if_name;
 
         tunnel.has_local_spi = TRUE;
         tunnel.local_spi = src_spi;
@@ -485,11 +487,14 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
         tunnel.has_enabled = TRUE;
         tunnel.enabled = TRUE;
 
-        // TODO: get interface name based on local IP
-        // tunnel.unnumbered =
+        req.tunnels = calloc(1, sizeof(Ipsec__TunnelInterfaces__Tunnel *));
+        req.tunnels[0] = &tunnel;
+        req.n_tunnels = 1;
 
         // do the actual RPC call
         rc = vac->put(vac, &req, &rsp);
+
+        free(if_name);
 
         free(req.tunnels);
 
@@ -515,7 +520,7 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             return FAILED;
         }
 
-        // REVIEW: hope these values are not reversed
+        // REVIEW: test if not reversed
         INIT(tun,
                .src_spi = src_spi,
                .src_addr = id->src->clone(id->src),
@@ -650,7 +655,9 @@ METHOD(kernel_ipsec_t, get_spi, status_t,
 METHOD(kernel_ipsec_t, destroy, void,
     private_kernel_vpp_ipsec_t *this)
 {
-    // TODO: free operations ! for strdup strings and so on
+    // TODO: loop over all hashes in tunnel
+    // and call destroy_tunnel(tun)
+
     this->mutex->destroy(this->mutex);
     this->tunnels->destroy(this->tunnels);
     this->sad->destroy(this->sad);
@@ -729,9 +736,10 @@ kernel_vpp_ipsec_t *kernel_vpp_ipsec_create()
             },
         },
         .mutex = mutex_create(MUTEX_TYPE_DEFAULT),
-        // TODO: test if hashtable_has_ptr is suitable for us !!
         .sad = hashtable_create(hashtable_hash_ptr, hashtable_equals_ptr, 4),
         // we can reuse this hash for both in and out registration of (SPI + IP)
+        // TODO: use hashtable_equals_ptr (default one) we don't need
+        // compersion right now (maybe ever)
         .tunnels = hashtable_create((hashtable_hash_t)tunnel_hash,
                                       (hashtable_equals_t)tunnel_equals, 32),
         .manage_routes = lib->settings->get_bool(lib->settings,
