@@ -158,40 +158,6 @@ static bool tunnel_equals(tunnel_t *one, tunnel_t *two)
 }
 
 /**
- * Get interface name by ip
- */
-static status_t get_sw_if_name(char *ip, char **if_name)
-{
-    Rpc__DumpRequest rq = RPC__DUMP_REQUEST__INIT;
-    Interfaces__Interfaces__Interface *iface;  
-    Rpc__InterfaceResponse *rp;
-    status_t rc;
-
-    size_t n_if, n_ip;
-
-    rc = vac->dump_interfaces(vac, &rq, &rp);
-    if (rc == SUCCESS)
-    {
-        n_if = rp->n_interfaces;
-        while (n_if--)
-        {
-            iface = rp->interfaces[n];
-            
-            n_ip = iface->n_ip_address;
-            while (n_ip--)
-            {
-                if (strcmp(ip, iface->ip_addresses[n_ip]) == 0)
-                {
-                    *if_name = strdup(iface->name);
-                    return SUCCESS;
-                }
-            }
-        }
-    }
-    return FAILED;
-}
-
-/**
  * Set if_name of tunnel interface based on match
  */
 static status_t set_tunnel_if_name(tunnel_t *tun)
@@ -413,6 +379,7 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
     {
         DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
              integrity_algorithm_names, data->int_alg);
+        return FAILED;
     }
 
     // inbound SA comes first
@@ -444,7 +411,7 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 
         src_spi = sa->spi;
 
-        if (!charon->kernel->get_interface_name(charon->kernel, id->src, &if_name))
+        if (!charon->kernel->get_interface(charon->kernel, id->src, &if_name))
         {
             free(sa);
             return FAILED;
@@ -458,7 +425,7 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
         tunnel.remote_ip = strndup(dst_addr.ptr,
                                    dst_addr.len);
 
-        tunnel.unnumbered = if_name;
+        tunnel.unnumbered_name = if_name;
 
         tunnel.has_local_spi = TRUE;
         tunnel.local_spi = src_spi;
