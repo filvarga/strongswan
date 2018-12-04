@@ -162,11 +162,8 @@ static bool tunnel_equals(tunnel_t *one, tunnel_t *two)
  */
 static status_t set_tunnel_if_name(tunnel_t *tun)
 {
-    // grpc trash
     Ipsec__TunnelInterfaces__Tunnel *tunnel = NULL;
-    Rpc__DumpRequest req = RPC__DUMP_REQUEST__INIT;
     Rpc__IPSecTunnelResponse *rsp = NULL;
-    //
 
     chunk_t src_addr;
     chunk_t dst_addr;
@@ -175,7 +172,7 @@ static status_t set_tunnel_if_name(tunnel_t *tun)
     status_t rc;
     size_t n;
 
-    rc = vac->dump_ipsec_tunnels(vac, &req, &rsp);
+    rc = vac->dump_ipsec_tunnels(vac, &rsp);
     if (rc == SUCCESS)
     {
         n = rsp->n_tunnels;
@@ -341,11 +338,9 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
     private_kernel_vpp_ipsec_t *this, kernel_ipsec_sa_id_t *id,
     kernel_ipsec_add_sa_t *data)
 {
-    // grpc trash
     Ipsec__TunnelInterfaces__Tunnel tunnel = IPSEC__TUNNEL_INTERFACES__TUNNEL__INIT;
     Rpc__DataRequest req = RPC__DATA_REQUEST__INIT;
     Rpc__PutResponse *rsp = NULL;
-    //
 
     tunnel_t *tun;
     status_t rc;

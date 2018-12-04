@@ -10,10 +10,9 @@ cd ${WS}/third_party/grpc-c
 git submodule update --init
 autoreconf --install
 ./builddeps.sh
-mkdir -p build && cd build
+mkdir build; cd build
 ../configure
 make
-sudo make install
 
 echo "Generating app-agent API files"
 cd ${WS}/third_party/vpp-agent
