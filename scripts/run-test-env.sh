@@ -72,10 +72,12 @@ conn gateway
 # local:
   left=172.16.0.2
   leftauth=psk
-  leftsubnet=0.0.0.0/0
+
+  leftsubnet=10.10.10.0/24
 
 # remote: (roadwarrior)
   rightauth=psk 
+  
 EOF
   cat << EOF > /tmp/responder/ipsec.secrets
 : PSK "Vpp123"
@@ -103,6 +105,9 @@ conn roadwarrior
 # remote: (gateway)
   right=172.16.0.2
   rightauth=psk
+
+  rightsubnet=10.10.10.0/24
+  
 EOF
   cat << EOF > /tmp/initiator/ipsec.secrets
 : PSK "Vpp123"
@@ -116,7 +121,12 @@ initiator_conf
 
 docker run --name responder -p 501:500 -p 171:170 -p 4501:4500 --net=dev-net --ip=172.16.0.2 -d --rm --privileged -v /tmp/responder:/etc/ipsec.d philplckthun/strongswan
 
+docker exec responder ip tuntap add dev tap0 mode tap
+docker exec responder ip addr add 10.10.10.1/24 dev tap0
+
 docker run --name initiator -p 502:500 -p 172:170 -p 4502:4500 --net=dev-net --ip=172.16.0.1 -d --rm --privileged -v /tmp/initiator:/etc/ipsec.d philplckthun/strongswan
+
+docker exec initiator ipsec up roadwarrior
 
 # docker exec -i -t initiator /bin/bash
 
