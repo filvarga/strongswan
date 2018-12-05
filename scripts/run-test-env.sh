@@ -1,38 +1,12 @@
 #!/bin/bash
 
-AGENT_CFG_DIR="/tmp"
-
-KAFKA_ADDRESS="172.16.0.4"
-KAFKA_PORT="9092"
-
-ETCD_ADDRESS="172.16.0.3"
-ETCD_PORT="2379"
-
-GRPC_ADDRESS="172.16.0.2"
-GRPC_PORT="9111"
-
-HOST_ADDRESS="172.16.0.2"
-
-kafka_conf() {
-  cat << EOF > $AGENT_CFG_DIR/kafka.conf
-addrs:
- - "$KAFKA_ADDRESS:$KAFKA_PORT"
-EOF
-}
-
-etcd_conf() {
-  cat << EOF > $AGENT_CFG_DIR/etcd.conf
-insecure-transport: true
-dial-timeout: 1000000000
-endpoints:
- - "$ETCD_ADDRESS:$ETCD_PORT"
-EOF
-}
+AGENT_CFG_DIR="/tmp/vpp-agent"
+INITIATOR_CFG_DIR="/tmp/initiator"
 
 grpc_conf() {
   cat << EOF > $AGENT_CFG_DIR/grpc.conf
 # GRPC endpoint defines IP address and port (if tcp type) or unix domain socket file (if unix type).
-endpoint: $GRPC_ADDRESS:$GRPC_PORT
+endpoint: 0.0.0.0:9111
 
 # If unix domain socket file is used for GRPC communication, permissions to the file can be set here.
 # Permission value uses standard three-or-four number linux binary reference.
@@ -55,9 +29,8 @@ EOF
 
 # TODO: as sudo
 responder_conf() {
-  mkdir -p /tmp/responder
-  cat << EOF > /tmp/responder/ipsec.conf
-conn gateway
+  sudo bash -c 'cat << EOF > /etc/ipsec.conf
+conn responder
 # defaults?
   auto=add
   compress=no
@@ -78,16 +51,16 @@ conn gateway
 # remote: (roadwarrior)
   rightauth=psk 
   
-EOF
-  cat << EOF > /tmp/responder/ipsec.secrets
+EOF'
+  sudo bash -c 'cat << EOF > /etc/ipsec.secrets
 : PSK "Vpp123"
-EOF
+EOF'
 }
 
 initiator_conf() {
-  mkdir -p /tmp/initiator
-  cat << EOF > /tmp/initiator/ipsec.conf
-conn roadwarrior
+  mkdir -p $INITIATOR_CFG_DIR
+  cat << EOF > $INITIATOR_CFG_DIR/ipsec.conf
+conn initiator
 # defaults?
   auto=add
   compress=no
@@ -109,37 +82,51 @@ conn roadwarrior
   rightsubnet=10.10.10.0/24
   
 EOF
-  cat << EOF > /tmp/initiator/ipsec.secrets
+  cat << EOF > $INITIATOR_CFG_DIR/ipsec.secrets
 : PSK "Vpp123"
 EOF
 }
 
-#responder_conf
-#initiator_conf
-
-#docker network create --driver=bridge --gateway=172.16.0.10 --subnet=172.16.0.0/24 dev-net
-
-#docker run --name responder -p 501:500 -p 171:170 -p 4501:4500 --net=dev-net --ip=172.16.0.2 -d --rm --privileged -v /tmp/responder:/etc/ipsec.d philplckthun/strongswan
-
-#docker exec responder ip tuntap add dev tap0 mode tap
-#docker exec responder ip addr add 10.10.10.1/24 dev tap0
-
-#docker run --name initiator -p 502:500 -p 172:170 -p 4502:4500 --net=dev-net --ip=172.16.0.1 -d --rm --privileged -v /tmp/initiator:/etc/ipsec.d philplckthun/strongswan
-
-#docker exec initiator ipsec up roadwarrior
-
-# docker exec -i -t initiator /bin/bash
-
-# docker run --net=dev-net --ip=172.16.0.1 --name roadwarrior --name strongswan -d --privileged --net=host -v /etc/ipsec.d:/etc/ipsec.d mberner/strongswan:v2
-
-docker run --net=dev-net --ip=$KAFKA_ADDRESS -d --name kafka --rm --env ADVERTISED_HOST=$KAFKA_ADDRESS --env ADVERTISED_PORT=$KAFKA_PORT spotify/kafka
-
-docker run --net=dev-net --ip=$ETCD_ADDRESS -d --name etcd --rm quay.io/coreos/etcd:v3.1.0 /usr/local/bin/etcd -advertise-client-urls http://$ETCD_ADDRESS:$ETCD_PORT -listen-client-urls http://$ETCD_ADDRESS:$ETCD_PORT
-
-kafka_conf
-etcd_conf
+responder_conf
+initiator_conf
 grpc_conf
 
-sleep 2
-docker run --net=dev-net --ip=$GRPC_ADDRESS -p 9111:9111  --privileged -it --name vpp --rm -v $AGENT_CFG_DIR:/opt/vpp-agent/dev ligato/vpp-agent
+# vpp-agent prerequisites (kafka + etcd)
+docker run --name kafka -p 9092:9092 -d --rm spotify/kafka
+docker run --name etcd -p 2379:2379 -d --rm quay.io/coreos/etcd:v3.1.0 /usr/local/bin/etcd
+sleep 1
 
+# responder aka vpn server (gateway)
+docker run --name responder -d --rm --net=host --privileged -it -v $AGENT_CFG_DIR:/opt/vpp-agent/dev ligato/vpp-agent
+
+# initiator aka vpn client
+docker run --name initiator -d --rm --privileged -v $INITIATOR_CFG_DIR:/etc/ipsec.d philplckthun/strongswan
+
+# dummy network behind vpn
+sleep 1
+docker exec responder vppctl -s localhost:5002 tap connect tap0
+docker exec responder vppctl -s localhost:5002 set int state tapcli-0 up
+docker exec responder vppctl -s localhost:5002 set int ip address tapcli-0 10.10.10.1/24
+
+# if we register veth interface in docker namespace docker will automatically
+# delete the interface after container is destroied
+# alternatively try to remove the interface: sudo ip link del wan0
+
+# 1) create veth pair
+sudo ip link add wan0 type veth peer name wan1
+# 2) add one side of the veth pair to responder
+docker exec responder vppctl -s localhost:5002 create host-interface name wan0
+docker exec responder vppctl -s localhost:5002 set int state host-wan0 up
+docker exec responder vppctl -s localhost:5002 set int ip address host-wan0 172.16.0.2/24
+# 3) add other side of the veth pair to the initiator container
+sudo ip link set netns $(docker inspect --format '{{.State.Pid}}' initiator) dev wan1
+docker exec initiator ip addr add 172.16.0.1/24 dev wan1
+docker exec initiator ip link set wan1 up
+
+# 1) try to connect to responder over ikev2 vpn
+# docker exec initiator ipsec up initiator 
+
+# to debug (responder):
+# docker exec -it responder vppctl -s localhost:5002
+# to debug (initiator):
+# docker exec -it initiator /bin/bash
