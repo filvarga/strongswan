@@ -86,10 +86,12 @@ conn responder
   esp=aes192-sha1-esn!
 
 # local:
-  left=172.16.0.2
+  left=%any
+  leftid=172.16.0.2
   leftauth=psk
 
-  leftsubnet=10.10.10.0/24
+# tell what subnets we offer
+  leftsubnet=0.0.0.0/0
 
 # remote: (roadwarrior)
   rightsourceip=10.10.20.0/24
@@ -124,7 +126,7 @@ conn initiator
   right=172.16.0.2
   rightauth=psk
 
-  rightsubnet=10.10.10.0/24
+  rightsubnet=0.0.0.0/0
 
 EOF"
   sudo bash -c "cat << EOF > $INITIATOR_CFG_DIR/strongswan.conf
@@ -151,6 +153,38 @@ include strongswan.d/*.conf
 EOF"
   sudo bash -c "cat << EOF > $INITIATOR_CFG_DIR/ipsec.secrets
 : PSK 'Vpp123'
+EOF"
+  sudo bash -c "cat << EOF > $INITIATOR_CFG_DIR/iptables_save
+*raw
+:PREROUTING ACCEPT [14661:4651426]
+:OUTPUT ACCEPT [17090:4328766]
+COMMIT
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+COMMIT
+*mangle
+:PREROUTING ACCEPT [511:151240]
+:INPUT ACCEPT [505:150608]
+:FORWARD ACCEPT [6:632]
+:OUTPUT ACCEPT [611:188749]
+:POSTROUTING ACCEPT [617:189381]
+COMMIT
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT DROP [0:0]
+
+-A INPUT -j ACCEPT
+
+-A FORWARD -s 10.10.20.1/32 -d 10.10.10.0/24 -i wan1 -m policy --dir in --pol ipsec --reqid 1 --proto esp -j ACCEPT
+-A FORWARD -s 10.10.10.0/24 -d 10.10.20.1/32 -o wan1 -m policy --dir out --pol ipsec --reqid 1 --proto esp -j ACCEPT
+
+-A OUTPUT -j ACCEPT
+
+COMMIT
 EOF"
 }
 
@@ -233,4 +267,5 @@ case "$1" in
 esac
 
 exit 0
+
 

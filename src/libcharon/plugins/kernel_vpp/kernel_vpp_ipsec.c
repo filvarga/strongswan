@@ -26,6 +26,8 @@
 #include <errno.h>
 #include <string.h>
 
+#define ENABLED 1
+
 #define IPV4_SZ 4
 #define PRIO_BASE 384
 #define MAX_UINT32_LEN 10
@@ -396,7 +398,7 @@ static status_t vpp_add_del_route(private_kernel_vpp_ipsec_t *this,
 
     id->dst_ts->to_subnet(id->dst_ts, &dst_net, &pfx_len);
 
-    if (op == ROUTE_ADD)
+    if (op == ROUTE_ADD && ENABLED)
     {
         rc = charon->kernel->add_route(charon->kernel, dst_net->get_address(
                                        dst_net), pfx_len, data->dst, NULL,
