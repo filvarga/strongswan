@@ -94,7 +94,7 @@ conn responder
   leftsubnet=0.0.0.0/0
 
 # remote: (roadwarrior)
-  rightsourceip=10.10.20.0/24
+  rightsourceip=192.168.192.0/24
   rightauth=psk
 
 EOF"
@@ -179,8 +179,8 @@ COMMIT
 
 -A INPUT -j ACCEPT
 
--A FORWARD -s 10.10.20.1/32 -d 10.10.10.0/24 -i wan1 -m policy --dir in --pol ipsec --reqid 1 --proto esp -j ACCEPT
--A FORWARD -s 10.10.10.0/24 -d 10.10.20.1/32 -o wan1 -m policy --dir out --pol ipsec --reqid 1 --proto esp -j ACCEPT
+-A FORWARD -s 10.10.10.0/24 -d 192.168.192.1/32 -i wan1 -m policy --dir in --pol ipsec --reqid 1 --proto esp -j ACCEPT
+-A FORWARD -s 192.168.192.1/32 -d 10.10.10.0/24 -o wan1 -m policy --dir out --pol ipsec --reqid 1 --proto esp -j ACCEPT
 
 -A OUTPUT -j ACCEPT
 
@@ -262,7 +262,7 @@ case "$1" in
         stop
         ;;
   *)
-        echo $"Usage: $0 {start|stop}"
+        echo $"Usage: $0 {start|stop|initiator|responder}"
         exit 1
 esac
 
