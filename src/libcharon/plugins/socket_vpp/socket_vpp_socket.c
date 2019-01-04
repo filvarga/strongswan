@@ -184,10 +184,11 @@ METHOD(socket_t, receiver, status_t,
         iov[1].iov_len = sizeof(eh);
         iov[2].iov_base = buf;
         iov[2].iov_len = this->max_packet;
+
         msg.msg_iov = iov;
         msg.msg_iovlen = 3;
-        msg.msg_name = this->addrs[0].sun_path;
-        msg.msg_namelen = sizeof(this->addrs[0].sun_path);
+        msg.msg_name = NULL;
+        msg.msg_namelen = 0;
         msg.msg_control = 0;
         msg.msg_controllen = 0;
         msg.msg_flags = 0;
@@ -272,10 +273,12 @@ METHOD(socket_t, sender, status_t,
     }
     raw = ip_packet->get_encoding(ip_packet);
     memset(&msg, 0, sizeof(struct msghdr));
+
     iov[0].iov_base = &packetdesc;
     iov[0].iov_len = sizeof(packetdesc);
     iov[1].iov_base = raw.ptr;
     iov[1].iov_len = raw.len;
+
     msg.msg_iov = iov;
     msg.msg_iovlen = 2;
     msg.msg_name = &this->write_addr;
@@ -286,6 +289,7 @@ METHOD(socket_t, sender, status_t,
 
     DBG1(DBG_NET, "kernel_vpp: write addr: %s", this->write_addr.sun_path);
 
+    // is it really possible to send over the same socket to other unix socket ?
     bytes_sent = sendmsg(this->socks[0], &msg, 0);
     if (bytes_sent < 0)
     {
